@@ -1026,6 +1026,48 @@ def get_document_versions(doc_name: str):
         raise HTTPException(500, f"버전 조회 실패: {str(e)}")
 
 
+@app.get("/rag/document/{doc_name}/diff")
+def get_document_diff(doc_name: str, v1: str, v2: str):
+    """두 버전 간의 조항별 차이점 비교"""
+    try:
+        diffs = sql_store.get_clause_diff(doc_name, v1, v2)
+        if diffs and "error" in diffs[0]:
+            raise HTTPException(400, diffs[0]["error"])
+        return {
+            "doc_name": doc_name,
+            "v1": v1,
+            "v2": v2,
+            "diffs": diffs,
+            "count": len(diffs)
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"비교 실패: {str(e)}")
+
+
+@app.get("/rag/changes")
+def get_changes(limit: int = 50):
+    """최근 문서 변경 이력 조회"""
+    try:
+        # SQLStore에 최근 변경 이력을 가져오는 메서드가 없으므로, 모든 문서를 가져와서 가공하거나
+        # 새로운 메서드를 추가해야 함. 여기서는 get_all_documents를 활용하여 최근 수정순으로 반환.
+        all_docs = sql_store.get_all_documents()
+        changes = []
+        for doc in all_docs[:limit]:
+            changes.append({
+                "id": str(doc.get('id')),
+                "doc_id": doc.get('doc_name'),
+                "change_type": "UPDATE" if doc.get('version') != "1.0" else "CREATE",
+                "changed_at": doc.get('created_at').isoformat() if doc.get('created_at') else None,
+                "changed_by": "System",
+                "description": f"Version {doc.get('version')} saved."
+            })
+        return {"changes": changes, "count": len(changes)}
+    except Exception as e:
+        raise HTTPException(500, f"변경 이력 조회 실패: {str(e)}")
+
+
 @app.get("/rag/document/{doc_name}/content")
 def get_document_content(doc_name: str, version: Optional[str] = None):
     """문서 전체 내용 조회"""

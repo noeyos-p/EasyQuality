@@ -5,6 +5,7 @@ import ChangeHistoryPanel from './components/history/ChangeHistoryPanel'
 import GraphVisualization from './components/graph/GraphVisualization'
 import DocumentViewer from './components/document/DocumentViewer'
 import ChatPanel from './components/chat/ChatPanel'
+import VersionDiffViewer from './components/history/VersionDiffViewer'
 import { API_URL } from './types'
 
 function App() {
@@ -24,6 +25,10 @@ function App() {
   const [isLeftVisible, setIsLeftVisible] = useState(true)
   const [isRightVisible, setIsRightVisible] = useState(true)
   const [isDraggingOver, setIsDraggingOver] = useState(false)
+
+  // 비교 모드 상태
+  const [isComparing, setIsComparing] = useState(false)
+  const [diffData, setDiffData] = useState<any>(null)
 
   // 백엔드 연결 확인
   useEffect(() => {
@@ -93,6 +98,24 @@ function App() {
       alert('저장 중 오류가 발생했습니다.')
     } finally {
       setIsSaving(false)
+    }
+  }
+
+  const handleCompare = async (docName: string, v1: string, v2: string) => {
+    try {
+      const response = await fetch(`${API_URL}/rag/document/${encodeURIComponent(docName)}/diff?v1=${v1}&v2=${v2}`)
+      if (response.ok) {
+        const data = await response.json()
+        setDiffData(data)
+        setIsComparing(true)
+        setActivePanel(null) // 사이드 패널 닫기 (공간 확보)
+      } else {
+        const error = await response.json()
+        alert(`비교 실패: ${error.detail || '알 수 없는 오류'}`)
+      }
+    } catch (error) {
+      console.error('비교 요청 오류:', error)
+      alert('비교 요청 중 오류가 발생했습니다.')
     }
   }
 
@@ -166,7 +189,7 @@ function App() {
             <DocumentManagementPanel onDocumentSelect={handleDocumentSelect} />
           )}
           {activePanel === 'history' && (
-            <ChangeHistoryPanel />
+            <ChangeHistoryPanel onCompare={handleCompare} selectedDocName={selectedDocument} />
           )}
         </div>
 
@@ -199,6 +222,14 @@ function App() {
             <GraphVisualization
               onNodeClick={(docId) => handleDocumentSelect(docId)}
               onSwitchToDocuments={() => setActivePanel('documents')}
+            />
+          ) : isComparing && diffData ? (
+            <VersionDiffViewer
+              diffData={diffData}
+              onClose={() => {
+                setIsComparing(false)
+                setDiffData(null)
+              }}
             />
           ) : selectedDocument && documentContent ? (
             <DocumentViewer

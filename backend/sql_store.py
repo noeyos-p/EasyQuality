@@ -396,11 +396,21 @@ class SQLStore:
 
         # v1 문서 ID 조회
         doc1 = self.get_document_by_name(doc_name, v1)
-        if not doc1: return [{"error": f"v{v1} 버전을 찾을 수 없습니다."}]
+        print(f"[DEBUG] v{v1} 문서 조회 결과: {doc1 is not None}")
+        if doc1:
+            print(f"[DEBUG] v{v1} document_id: {doc1['id']}")
+        if not doc1: 
+            print(f"[ERROR] v{v1} 버전을 찾을 수 없습니다.")
+            return [{"error": f"v{v1} 버전을 찾을 수 없습니다."}]
 
         # v2 문서 ID 조회
         doc2 = self.get_document_by_name(doc_name, v2)
-        if not doc2: return [{"error": f"v{v2} 버전을 찾을 수 없습니다."}]
+        print(f"[DEBUG] v{v2} 문서 조회 결과: {doc2 is not None}")
+        if doc2:
+            print(f"[DEBUG] v{v2} document_id: {doc2['id']}")
+        if not doc2: 
+            print(f"[ERROR] v{v2} 버전을 찾을 수 없습니다.")
+            return [{"error": f"v{v2} 버전을 찾을 수 없습니다."}]
 
         # 조항별로 content를 병합한 후 비교
         query = """
@@ -441,11 +451,20 @@ class SQLStore:
                 with conn.cursor(cursor_factory=RealDictCursor) as cur:
                     cur.execute(query, (doc1['id'], doc2['id']))
                     rows = cur.fetchall()
+                    
+                    # 디버깅: 전체 결과 통계
+                    print(f"[DEBUG] 총 {len(rows)}개 조항 비교됨")
+                    change_stats = {}
+                    for row in rows:
+                        change_type = row['change_type']
+                        change_stats[change_type] = change_stats.get(change_type, 0) + 1
+                    print(f"[DEBUG] 변경 유형별 통계: {change_stats}")
 
                     for row in rows:
                         if row['change_type'] != 'UNCHANGED':
                             diffs.append(dict(row))
 
+            print(f"[DEBUG] 반환할 차이점: {len(diffs)}개")
             return diffs
         except Exception as e:
             print(f"🔴 [SQLStore] 조항 비교 실패: {e}")
