@@ -74,9 +74,32 @@ export default function DocumentManagementPanel({ onDocumentSelect }: DocumentMa
       );
 
       setGroupedDocuments(sortedGroups);
+      return docs.length; // 문서 개수 반환
     } catch (error) {
       console.error('문서 목록 조회 실패:', error);
+      return 0;
     }
+  };
+
+  // 비동기 업로드 완료 감지를 위한 폴링 로직
+  const startPolling = (initialCount: number) => {
+    let attempts = 0;
+    const maxAttempts = 12; // 3초 * 12 = 36초
+
+    console.log(`🚀 [Polling] 자동 갱신 시작 (현재 문서 수: ${initialCount})`);
+
+    const intervalId = setInterval(async () => {
+      attempts++;
+      const currentCount = await fetchDocuments();
+
+      console.log(`🔄 [Polling] 시도 ${attempts}/${maxAttempts} (문서 수: ${currentCount})`);
+
+      // 새 문서가 추가되었거나 최대 시도 횟수에 도달하면 폴링 중단
+      if (currentCount > initialCount || attempts >= maxAttempts) {
+        clearInterval(intervalId);
+        console.log(currentCount > initialCount ? "✅ [Polling] 새 문서 감지됨!" : "⏱️ [Polling] 최대 시간 도달로 종료");
+      }
+    }, 3000);
   };
 
   const toggleGroup = (category: string) => {
@@ -182,12 +205,20 @@ export default function DocumentManagementPanel({ onDocumentSelect }: DocumentMa
 
       if (response.ok) {
         await response.json();
-        setUploadProgress('🟢 업로드 완료!');
+        setUploadProgress('🟢 업로드 완료! (서버 처리 중...)');
+
+        // 현재 문서 수 확인
+        const currentCount = Array.from(groupedDocuments.values()).reduce(
+          (acc, group) => acc + group.documents.length,
+          0
+        );
+
         setTimeout(() => {
           setIsUploadModalOpen(false);
           setUploadFile(null);
           setUploadProgress('');
-          fetchDocuments();
+          // 🆕 비동기 처리가 완료되어 리스트에 나타날 때까지 폴링 시작
+          startPolling(currentCount);
         }, 1500);
       } else {
         setUploadProgress('🔴 업로드 실패');
