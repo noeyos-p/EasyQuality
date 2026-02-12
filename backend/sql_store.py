@@ -37,13 +37,30 @@ class SQLStore:
             
         # sop_id의 UNIQUE 제약조건을 제거하고 (sop_id, version) 복합 유니크를 권장하지만,
         query = """
-        -- users 테이블
+        -- users 테이블 (확장)
         CREATE TABLE IF NOT EXISTS users (
             id SERIAL PRIMARY KEY,
             name TEXT NOT NULL,
             rank TEXT,
-            dept TEXT
+            dept TEXT,
+            username TEXT UNIQUE,
+            password_hash TEXT,
+            email TEXT,
+            last_login TIMESTAMP,
+            created_at TIMESTAMP DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Seoul')
         );
+
+        -- [Migration] users 테이블 컬럼 추가 (기존 테이블 마이그레이션)
+        DO $$ 
+        BEGIN 
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT UNIQUE;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TIMESTAMP;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Seoul');
+        EXCEPTION
+            WHEN duplicate_column THEN RAISE NOTICE 'column already exists';
+        END $$;
 
         -- doc_name 테이블 (문서명 마스터)
         CREATE TABLE IF NOT EXISTS doc_name (
@@ -75,7 +92,7 @@ class SQLStore:
             document_id INTEGER REFERENCES document(id) ON DELETE CASCADE
         );
 
-        -- memory 테이블
+        -- memory 테이블 (Long-term Memory)
         CREATE TABLE IF NOT EXISTS memory (
             id SERIAL PRIMARY KEY,
             answer TEXT,
@@ -90,6 +107,7 @@ class SQLStore:
         CREATE INDEX IF NOT EXISTS idx_chunk_metadata ON chunk USING GIN (metadata);
         CREATE INDEX IF NOT EXISTS idx_memory_users_id ON memory(users_id);
         CREATE INDEX IF NOT EXISTS idx_document_doc_name_id ON document(doc_name_id);
+        CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
 
         -- [Migration] doc_name 컬럼이 존재할 경우 삭제 (v2 전환 완료 후)
         DO $$ 
@@ -413,13 +431,13 @@ class SQLStore:
             return [{"error": f"v{v2} 버전을 찾을 수 없습니다."}]
 
         # 조항별로 content를 병합한 후 비교
-        query = """
+        query = r"""
             WITH v1_clauses AS (
                 SELECT
                     clause,
                     STRING_AGG(content, ' ' ORDER BY id) as content
                 FROM chunk
-                WHERE document_id = %s AND clause IS NOT NULL
+                WHERE document_id = %%s AND clause IS NOT NULL
                 GROUP BY clause
             ),
             v2_clauses AS (
@@ -427,7 +445,7 @@ class SQLStore:
                     clause,
                     STRING_AGG(content, ' ' ORDER BY id) as content
                 FROM chunk
-                WHERE document_id = %s AND clause IS NOT NULL
+                WHERE document_id = %%s AND clause IS NOT NULL
                 GROUP BY clause
             )
             SELECT
@@ -435,7 +453,7 @@ class SQLStore:
                 CASE
                     WHEN v1.clause IS NULL THEN 'ADDED'
                     WHEN v2.clause IS NULL THEN 'DELETED'
-                    WHEN REGEXP_REPLACE(v1.content, '\s+', '', 'g') <> REGEXP_REPLACE(v2.content, '\s+', '', 'g') THEN 'MODIFIED'
+                    WHEN REGEXP_REPLACE(v1.content, r'\s+', '', 'g') <> REGEXP_REPLACE(v2.content, r'\s+', '', 'g') THEN 'MODIFIED'
                     ELSE 'UNCHANGED'
                 END as change_type,
                 v1.content as v1_content,
@@ -518,8 +536,48 @@ class SQLStore:
             return False
 
     # Users 테이블 관련 메서드
+    def register_user(self, username: str, password_hash: str, name: str, email: str = None, rank: str = None, dept: str = None) -> Optional[int]:
+        """[Auth] 신규 사용자 가입 (비밀번호 해시 포함)"""
+        insert_query = """
+            INSERT INTO users (username, password_hash, name, email, rank, dept, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Seoul')
+            RETURNING id;
+        """
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(insert_query, (username, password_hash, name, email, rank, dept))
+                    user_id = cur.fetchone()[0]
+                    conn.commit()
+            return user_id
+        except Exception as e:
+            print(f" [SQLStore] 사용자 가입 실패: {e}")
+            return None
+
+    def get_user_by_username(self, username: str) -> Optional[Dict]:
+        """[Auth] 로그인 ID로 사용자 조회 (비밀번호 검증용)"""
+        query = "SELECT id, username, password_hash, name, email, rank, dept, last_login, created_at FROM users WHERE username = %s"
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute(query, (username,))
+                    return cur.fetchone()
+        except Exception:
+            return None
+
+    def update_last_login(self, user_id: int):
+        """[Auth] 마지막 로그인 시간 갱신"""
+        query = "UPDATE users SET last_login = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Seoul') WHERE id = %s"
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(query, (user_id,))
+                    conn.commit()
+        except Exception as e:
+            print(f" [SQLStore] 마지막 로그인 갱신 실패: {e}")
+
     def save_user(self, name: str, rank: str = None, dept: str = None) -> Optional[int]:
-        """사용자 저장"""
+        """[Legacy] 사용자 저장 (기존 코드 호환용 - username은 null)"""
         insert_query = "INSERT INTO users (name, rank, dept) VALUES (%s, %s, %s) RETURNING id;"
         try:
             with self._get_connection() as conn:
@@ -534,7 +592,7 @@ class SQLStore:
 
     def get_user(self, user_id: int) -> Optional[Dict]:
         """사용자 조회"""
-        query = "SELECT id, name, rank, dept FROM users WHERE id = %s"
+        query = "SELECT id, username, name, rank, dept, email, last_login FROM users WHERE id = %s"
         try:
             with self._get_connection() as conn:
                 with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -574,6 +632,16 @@ class SQLStore:
                     return cur.fetchall()
         except Exception:
             return []
+
+    def get_conversation_history(self, user_id: int, limit: int = 10) -> List[Dict]:
+        """대화 기록 조회 (Agent용 포맷)"""
+        memories = self.get_memory_by_user(user_id, limit)
+        history = []
+        # 최신순으로 가져왔으므로 역순으로 정렬하여 시간순으로 배치
+        for mem in reversed(memories):
+            history.append({"role": "user", "content": mem["question"]})
+            history.append({"role": "assistant", "content": mem["answer"]})
+        return history
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 마이그레이션 함수

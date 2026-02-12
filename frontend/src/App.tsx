@@ -6,9 +6,14 @@ import GraphVisualization from './components/graph/GraphVisualization'
 import DocumentViewer from './components/document/DocumentViewer'
 import ChatPanel from './components/chat/ChatPanel'
 import VersionDiffViewer from './components/history/VersionDiffViewer'
+import AuthModal from './components/auth/AuthModal'
+import { useAuth } from './hooks/useAuth'
 import { API_URL } from './types'
 
 function App() {
+  // 인증 상태
+  const { isAuthenticated, isLoading: authLoading, user, login, register, logout } = useAuth()
+
   // 서버 상태
   const [isConnected, setIsConnected] = useState(false)
   const [agentStatus, setAgentStatus] = useState<string>('연결 확인 중...')
@@ -138,6 +143,23 @@ function App() {
     }
   }
 
+  // 인증 로딩 중
+  if (authLoading) {
+    return (
+      <div className="fixed inset-0 flex items-center justify-center" style={{ background: '#0d0d0d' }}>
+        <div className="flex flex-col items-center gap-4">
+          <div className="w-10 h-10 border-4 border-dark-border border-t-accent-blue rounded-full animate-spin" />
+          <span className="text-txt-secondary text-[13px]">인증 확인 중...</span>
+        </div>
+      </div>
+    )
+  }
+
+  // 미인증 → 로그인 모달
+  if (!isAuthenticated) {
+    return <AuthModal onLogin={login} onRegister={register} />
+  }
+
   return (
     <div className="flex flex-col h-screen overflow-hidden">
       {/* 헤더 */}
@@ -183,10 +205,27 @@ function App() {
           )}
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-3">
           <span className={`text-[12px] ${isConnected ? 'text-accent' : 'text-[#f48771]'}`}>
             {isConnected ? '[OK]' : '[ERROR]'} {agentStatus}
           </span>
+
+          {/* 사용자 정보 & 로그아웃 */}
+          {user && (
+            <div className="flex items-center gap-2 ml-1 pl-3 border-l border-dark-border">
+              <span className="text-[12px] text-txt-secondary">
+                <span className="text-accent-blue font-medium">{user.name || user.username}</span>
+                {user.dept && <span className="text-txt-muted ml-1">({user.dept})</span>}
+              </span>
+              <button
+                onClick={logout}
+                className="bg-transparent border border-dark-border text-txt-muted py-0.5 px-2 text-[11px] rounded cursor-pointer transition-all duration-200 hover:bg-dark-hover hover:text-[#f48771] hover:border-[#f48771]/30"
+              >
+                로그아웃
+              </button>
+            </div>
+          )}
+
           <button
             className={`border-none py-1 px-2 text-[14px] rounded cursor-pointer flex items-center justify-center transition-all duration-200 ${isRightVisible ? 'bg-transparent text-txt-secondary hover:bg-dark-hover hover:text-accent' : 'bg-accent/10 text-accent'}`}
             onClick={() => setIsRightVisible(!isRightVisible)}

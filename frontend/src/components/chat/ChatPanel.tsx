@@ -85,9 +85,13 @@ export default function ChatPanel({ isVisible, onDocumentSelect }: ChatPanelProp
     const startTime = Date.now()
 
     try {
+      const token = localStorage.getItem('auth_token')
+      const headers: any = { 'Content-Type': 'application/json' }
+      if (token) headers['Authorization'] = `Bearer ${token}`
+
       const response = await fetch(`${API_URL}/chat`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: headers,
         body: JSON.stringify({
           message: currentDocs.length > 0
             ? `[Selected Documents: ${currentDocs.join(', ')}]\n${currentInput}`

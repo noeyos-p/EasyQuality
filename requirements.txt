@@ -7,6 +7,10 @@ fastapi
 uvicorn
 python-multipart
 
+# === 인증 & 보안 (Auth) ===
+passlib[bcrypt]
+python-jose[cryptography]
+
 # === 데이터베이스 ===
 psycopg2-binary
 neo4j

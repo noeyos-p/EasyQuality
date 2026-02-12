@@ -12,21 +12,37 @@ RAG 챗봇 API v14.0 + Agent (OpenAI)
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks
+from datetime import datetime, timedelta, timezone
+from typing import Optional, List, Dict, Any, Union, Literal
+
+# 한국 시간대 (KST) 정의
+KST = timezone(timedelta(hours=9))
+import re
+from pydantic import BaseModel, Field, field_validator
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form, BackgroundTasks, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel, Field
-from typing import List, Dict, Optional, Literal
+from fastapi.responses import JSONResponse, Response, FileResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from passlib.context import CryptContext
+from jose import JWTError, jwt
+import uvicorn
+import os
+import io
+import shutil
+import asyncio
+import json
+import logging
 from contextlib import asynccontextmanager
 import torch
 import time
-import asyncio
 import re
 import uuid
-import json
 from io import BytesIO
 
+import backend.agent as agent_module
 from backend.sql_store import SQLStore
+
 sql_store = SQLStore()
 # sql_store.init_db()  #  main()으로 이동하여 중복 호출 방지
 
@@ -96,6 +112,8 @@ class LLMRequest(BaseModel):
     backend: str = "ollama"
     max_tokens: int = 256
     temperature: float = 0.1
+
+# 부서/직책 기본 목록 (DB에 데이터가 없을 때 사용)
 
 class DeleteDocRequest(BaseModel):
     doc_name: str
@@ -390,6 +408,110 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# 인증 (Authentication) 및 사용자 관리
+# ═══════════════════════════════════════════════════════════════════════════
+
+# === Auth Configuration ===
+SECRET_KEY = "super-secret-key-change-this-in-production"  # TODO: 환경변수로 이동
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24시간
+
+# === Security Context ===
+pwd_context = CryptContext(schemes=["pbkdf2_sha256", "bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login")
+
+# === Auth Models ===
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+    user: Dict
+
+class TokenData(BaseModel):
+    username: Optional[str] = None
+
+class UserRegister(BaseModel):
+    username: str
+    password: str
+    name: str
+    email: str
+    rank: Optional[str] = None
+    dept: Optional[str] = None
+
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, v):
+        if not v:
+            return v
+        regex = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+        if not re.match(regex, v):
+            raise ValueError("올바른 이메일 형식이 아닙니다.")
+        return v
+
+class UserLogin(BaseModel):
+    username: str
+    password: str
+
+class UserSnippet(BaseModel):
+    username: str
+    name: str
+
+class PasswordReset(BaseModel):
+    user_id: int
+    new_password: str
+
+class FindUsernameRequest(BaseModel):
+    name: str
+    dept: Optional[str] = None
+
+# === Auth Utils ===
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    now_kst = datetime.now(KST)
+    if expires_delta:
+        expire = now_kst + expires_delta
+    else:
+        expire = now_kst + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+        token_data = TokenData(username=username)
+    except JWTError:
+        raise credentials_exception
+    
+    user = sql_store.get_user_by_username(token_data.username)
+    if user is None:
+        raise credentials_exception
+    return user
+
+oauth2_scheme_optional = OAuth2PasswordBearer(tokenUrl="auth/login", auto_error=False)
+
+async def get_current_user_optional(token: Optional[str] = Depends(oauth2_scheme_optional)):
+    if not token: return None
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None: return None
+    except JWTError:
+        return None
+    return sql_store.get_user_by_username(username)
 
 
 def process_save_task(
@@ -823,9 +945,16 @@ async def chat_worker():
     큐에서 질문을 하나씩 꺼내어 순차적으로 답변을 생성하는 워커
     """
     while True:
-        request_id, request = await chat_queue.get()
+        # v14.2: user_id 추가 (튜플 언패킹: 3개 요소)
+        item = await chat_queue.get()
+        if len(item) == 3:
+            request_id, request, user_id = item
+        else:
+            request_id, request = item
+            user_id = None
+
         try:
-            print(f" 🚀 [Chat Worker] 처리 시작: {request_id}")
+            print(f" 🚀 [Chat Worker] 처리 시작: {request_id} (User: {user_id})")
             # 🆕 처리 시작 시 순번 정보 제거 및 상태 변경
             chat_results[request_id] = {"status": "processing", "result": None}
             if "position" in chat_results[request_id]:
@@ -836,19 +965,36 @@ async def chat_worker():
                 chat_pending_ids.remove(request_id)
 
             # Agent 실행 (이벤트 루프 차단을 방지하기 위해 별도 스레드에서 실행)
-            # v14.1.1: asyncio.to_thread 도입 (문서 목록 사라짐 등 UI 차단 해결)
             from backend.agent import run_agent, init_agent_tools
             init_agent_tools(vector_store, get_graph_store(), sql_store)
             
+            # 🧠 롱텀 메모리: 이전 대화 기록 조회
+            chat_history = []
+            if user_id:
+                try:
+                    chat_history = sql_store.get_conversation_history(user_id, limit=6)
+                    print(f"  🧠 [Memory] 사용자 {user_id}의 대화 기록 {len(chat_history)}건 로드")
+                except Exception as e:
+                    print(f"  ⚠️ [Memory] 조회 실패: {e}")
+
             response = await asyncio.to_thread(
                 run_agent,
                 query=request.message,
                 session_id=request.session_id or str(uuid.uuid4()),
-                model_name=request.llm_model or "gpt-4o-mini"
+                model_name=request.llm_model or "gpt-4o-mini",
+                chat_history=chat_history  # 히스토리 전달
             )
             
             answer = response.get("answer")
             
+            # 🧠 롱텀 메모리: 새로운 대화 저장
+            if user_id and answer:
+                try:
+                    sql_store.save_memory(request.message, answer, user_id)
+                    print(f"  💾 [Memory] 대화 내용 저장 완료")
+                except Exception as e:
+                    print(f"  ⚠️ [Memory] 저장 실패: {e}")
+
             evaluation_scores = None
             error_patterns = ["오류가 발생", "에러", "실패", "Error", "Exception", "찾을 수 없", "준비하지 못", "로딩 에러"]
             is_error_message = any(pattern in answer for pattern in error_patterns)
@@ -889,20 +1035,23 @@ async def chat_worker():
             chat_queue.task_done()
 
 @app.post("/chat")
-async def chat(request: ChatRequest):
+async def chat(request: ChatRequest, current_user: Optional[Dict] = Depends(get_current_user_optional)):
     """
     순차 대기열 채팅 엔드포인트
     - 요청을 즉시 큐에 담고 대기 순번을 반환할 수 있도록 준비
+    - 인증된 사용자(current_user)가 있으면 user_id를 함께 전달하여 롱텀 메모리 기능 활성화
     """
     request_id = str(uuid.uuid4())
-    print(f" [Agent] 대기열 등록: {request_id}")
+    user_id = current_user['id'] if current_user else None
+    
+    print(f" [Agent] 대기열 등록: {request_id} (User: {user_id})")
     
     # 상태 초기화
     chat_results[request_id] = {"status": "waiting", "result": None}
     chat_pending_ids.append(request_id)
     
-    # 큐에 추가
-    await chat_queue.put((request_id, request))
+    # 큐에 추가 (v14.2: user_id 포함)
+    await chat_queue.put((request_id, request, user_id))
     
     # 현재 대기 순번 계산 (자신 포함)
     position = chat_pending_ids.index(request_id) + 1
@@ -1939,6 +2088,141 @@ def evaluate_answer(request: EvaluationRequest):
 # ═══════════════════════════════════════════════════════════════════════════
 # 서버 실행
 # ═══════════════════════════════════════════════════════════════════════════
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# === Auth Endpoints ===
+
+# 부서/직책 기본 목록
+DEFAULT_DEPARTMENTS = ["품질관리부", "품질보증부", "생산부", "연구개발부", "경영지원부", "영업부"]
+DEFAULT_RANKS = ["사원", "주임", "대리", "과장", "차장", "부장", "이사", "상무"]
+
+@app.get("/auth/options")
+def get_auth_options():
+    """회원가입 시 부서/직책 드롭다운 옵션 조회"""
+    depts = set(DEFAULT_DEPARTMENTS)
+    ranks = set(DEFAULT_RANKS)
+    try:
+        with sql_store._get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT DISTINCT dept FROM users WHERE dept IS NOT NULL AND dept != ''")
+                for row in cur.fetchall():
+                    depts.add(row[0])
+                cur.execute("SELECT DISTINCT rank FROM users WHERE rank IS NOT NULL AND rank != ''")
+                for row in cur.fetchall():
+                    ranks.add(row[0])
+    except Exception:
+        pass
+    return {
+        "departments": sorted(list(depts)),
+        "ranks": sorted(list(ranks))
+    }
+
+@app.post("/auth/register", response_model=Token)
+async def register(user: UserRegister):
+    # 중복 체크
+    existing_user = sql_store.get_user_by_username(user.username)
+    if existing_user:
+        raise HTTPException(status_code=400, detail="이미 존재하는 아이디입니다.")
+    
+    # 비밀번호 해시 & 저장
+    hashed_pw = get_password_hash(user.password)
+    user_id = sql_store.register_user(
+        username=user.username,
+        password_hash=hashed_pw,
+        name=user.name,
+        email=user.email,
+        rank=user.rank,
+        dept=user.dept
+    )
+    
+    if not user_id:
+        raise HTTPException(status_code=500, detail="회원가입 처리에 실패했습니다.")
+    
+    # 회원가입 직후 로그인 상태로 간주하여 last_login 갱신
+    sql_store.update_last_login(user_id)
+    
+    # 자동 로그인 처리 (토큰 발급)
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user.username, "user_id": user_id},
+        expires_delta=access_token_expires
+    )
+    
+    # 사용자 정보 조회 (응답용)
+    new_user = sql_store.get_user(user_id)
+    
+    return {"access_token": access_token, "token_type": "bearer", "user": new_user}
+
+@app.post("/auth/login", response_model=Token)
+async def login(user_req: UserLogin):
+    user = sql_store.get_user_by_username(user_req.username)
+    if not user or not verify_password(user_req.password, user['password_hash']):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="아이디 또는 비밀번호가 올바르지 않습니다.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    # 로그인 성공: last_login 갱신 & 토큰 발급
+    sql_store.update_last_login(user['id'])
+    # 갱신된 정보(last_login 등)를 다시 가져옴
+    user = sql_store.get_user_by_username(user_req.username)
+    
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user['username'], "user_id": user['id']},
+        expires_delta=access_token_expires
+    )
+    
+    # 민감 정보 제거
+    user_resp = {k: v for k, v in user.items() if k != 'password_hash'}
+    
+    return {"access_token": access_token, "token_type": "bearer", "user": user_resp}
+
+@app.get("/auth/me")
+async def read_users_me(current_user: Dict = Depends(get_current_user)):
+    user_resp = {k: v for k, v in current_user.items() if k != 'password_hash'}
+    return {"user": user_resp}
+
+@app.post("/auth/find-username")
+async def find_username(req: FindUsernameRequest):
+    """이름과 부서로 아이디 찾기"""
+    with sql_store._get_connection() as conn:
+        with conn.cursor() as cur:
+            query = "SELECT username FROM users WHERE name = %s"
+            params = [req.name]
+            if req.dept and req.dept != '전체':
+                query += " AND dept = %s"
+                params.append(req.dept)
+            
+            cur.execute(query, tuple(params))
+            res = cur.fetchone()
+            if res:
+                return {"username": res[0]}
+            raise HTTPException(status_code=404, detail="일치하는 사용자를 찾을 수 없습니다.")
+
+@app.post("/auth/verify-user")
+async def verify_user_identity(req: UserSnippet):
+    """비밀번호 재설정을 위한 본인 확인 (아이디 + 이름)"""
+    user = sql_store.get_user_by_username(req.username)
+    if user and user['name'] == req.name:
+        return {"user_id": user['id']}
+    raise HTTPException(status_code=404, detail="사용자 정보가 일치하지 않습니다.")
+
+@app.post("/auth/reset-password")
+async def reset_password_endpoint(req: PasswordReset):
+    """비밀번호 재설정"""
+    hashed_pw = get_password_hash(req.new_password)
+    try:
+        with sql_store._get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE users SET password_hash = %s WHERE id = %s", (hashed_pw, req.user_id))
+                conn.commit()
+        return {"message": "비밀번호가 변경되었습니다."}
+    except Exception:
+        raise HTTPException(status_code=500, detail="비밀번호 변경 실패")
+
 
 def main():
     print("[시스템] 초기화 중...")
