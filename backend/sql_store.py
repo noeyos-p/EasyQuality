@@ -97,9 +97,14 @@ class SQLStore:
             id SERIAL PRIMARY KEY,
             answer TEXT,
             question TEXT,
+            embedding vector(384),        -- 🆕 임베딩 데이터 컬럼
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             users_id INTEGER REFERENCES users(id) ON DELETE SET NULL
         );
+
+        -- [Migration] memory 테이블 embedding 컬럼 추가
+        CREATE EXTENSION IF NOT EXISTS vector;
+        ALTER TABLE memory ADD COLUMN IF NOT EXISTS embedding vector(384);
 
         -- 인덱스 생성
         CREATE INDEX IF NOT EXISTS idx_chunk_document_id ON chunk(document_id);
@@ -602,13 +607,19 @@ class SQLStore:
             return None
 
     # Memory 테이블 관련 메서드
-    def save_memory(self, question: str, answer: str, users_id: int = None) -> Optional[int]:
+    def save_memory(self, question: str, answer: str, users_id: int = None, embedding: List[float] = None) -> Optional[int]:
         """대화 기록 저장"""
-        insert_query = "INSERT INTO memory (question, answer, users_id) VALUES (%s, %s, %s) RETURNING id;"
+        if embedding:
+            insert_query = "INSERT INTO memory (question, answer, users_id, embedding) VALUES (%s, %s, %s, %s) RETURNING id;"
+            params = (question, answer, users_id, embedding)
+        else:
+            insert_query = "INSERT INTO memory (question, answer, users_id) VALUES (%s, %s, %s) RETURNING id;"
+            params = (question, answer, users_id)
+            
         try:
             with self._get_connection() as conn:
                 with conn.cursor() as cur:
-                    cur.execute(insert_query, (question, answer, users_id))
+                    cur.execute(insert_query, params)
                     memory_id = cur.fetchone()[0]
                     conn.commit()
             return memory_id
