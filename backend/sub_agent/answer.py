@@ -90,27 +90,5 @@ def answer_agent_node(state: AgentState):
     # [DONE] 태그를 마지막에 추가
     converted += "\n[DONE]"
 
-    # ========================================
-    # 검증 (Validation)
-    # ========================================
-    try:
-        from backend.validation import validate_format, validate_coverage
-
-        # 형식 검증
-        format_result = validate_format(converted)
-        if not format_result["valid"]:
-            print(f"🔴 [답변 에이전트 검증 실패 - 형식]")
-            for error in format_result["errors"]:
-                print(f"   - {error}")
-
-        # 커버리지 검증
-        coverage_result = validate_coverage(state.get("query", ""), converted)
-        if not coverage_result["valid"]:
-            print(f"🔴 [답변 에이전트 검증 경고 - 커버리지]")
-            for warning in coverage_result["warnings"]:
-                print(f"   - {warning}")
-
-    except Exception as e:
-        print(f"🔴 [검증 모듈 로드 실패] {e}")
 
     return {"messages": [{"role": "assistant", "content": converted}]}
