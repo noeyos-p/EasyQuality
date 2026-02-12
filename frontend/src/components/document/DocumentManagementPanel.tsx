@@ -27,6 +27,7 @@ interface Version {
 
 interface DocumentManagementPanelProps {
   onDocumentSelect?: (docId: string, content?: string) => void;
+  onNotify?: (message: string, type?: 'success' | 'error' | 'info') => void; // 🆕 알림 트리거용 프롭스
 }
 
 export default function DocumentManagementPanel({ onDocumentSelect }: DocumentManagementPanelProps) {
@@ -42,6 +43,21 @@ export default function DocumentManagementPanel({ onDocumentSelect }: DocumentMa
   // 🆕 배경 처리 상태 관리
   const [isProcessing, setIsProcessing] = useState(false);
   const [processingFileName, setProcessingFileName] = useState<string>('');
+
+  // 🆕 외부(App.tsx)에서 발생한 저장 이벤트를 감지하여 로딩바 시작
+  useEffect(() => {
+    const handleSaveStart = (e: any) => {
+      const { docName } = e.detail;
+      setIsProcessing(true);
+      setProcessingFileName(`저장 중: ${docName}`);
+
+      // 저장 완료 감지를 위한 폴링 (버전이 올라가거나 일정 시간 후 목록 갱신)
+      startPollingForSave(docName);
+    };
+
+    window.addEventListener('document_processing_start', handleSaveStart);
+    return () => window.removeEventListener('document_processing_start', handleSaveStart);
+  }, []);
 
   // 문서 목록 로드
   useEffect(() => {
@@ -88,7 +104,7 @@ export default function DocumentManagementPanel({ onDocumentSelect }: DocumentMa
   // 비동기 업로드 완료 감지를 위한 폴링 로직
   const startPolling = (initialCount: number) => {
     let attempts = 0;
-    const maxAttempts = 12; // 3초 * 12 = 36초
+    const maxAttempts = 15; // 3초 * 15 = 45초
 
     console.log(`🚀 [Polling] 자동 갱신 시작 (현재 문서 수: ${initialCount})`);
 
@@ -98,12 +114,44 @@ export default function DocumentManagementPanel({ onDocumentSelect }: DocumentMa
 
       console.log(`🔄 [Polling] 시도 ${attempts}/${maxAttempts} (문서 수: ${currentCount})`);
 
-      // 새 문서가 추가되었거나 최대 시도 횟수에 도달하면 폴링 중단
       if (currentCount > initialCount || attempts >= maxAttempts) {
         clearInterval(intervalId);
-        setIsProcessing(false); // 🆕 처리 완료 표시
+        setIsProcessing(false);
         setProcessingFileName('');
-        console.log(currentCount > initialCount ? "✅ [Polling] 새 문서 감지됨!" : "⏱️ [Polling] 최대 시간 도달로 종료");
+        if (currentCount > initialCount && onNotify) {
+          onNotify("문서 업로드 및 분석이 완료되었습니다. 🎉", "success");
+        }
+      }
+    }, 3000);
+  };
+
+  // 🆕 저장 완료 감지를 위한 폴링 로직 (버전 비교)
+  const startPollingForSave = (docName: string) => {
+    let attempts = 0;
+    const maxAttempts = 15;
+
+    const intervalId = setInterval(async () => {
+      attempts++;
+
+      // 버전 목록 조회
+      try {
+        const res = await fetch(`${API_URL}/rag/document/${docName}/versions`);
+        const data = await res.json();
+        // 단순히 시간 기반 또는 성공 응답 여부로 처리해도 되지만, 여기서는 fetchDocuments로 전체 갱신 유도
+        await fetchDocuments();
+
+        if (attempts >= maxAttempts) {
+          clearInterval(intervalId);
+          setIsProcessing(false);
+          setProcessingFileName('');
+        } else if (attempts === 4) { // 대략 12초 후 "완료" 알림 (분석 속도 감안)
+          if (onNotify) onNotify(`'${docName}' 저장 및 분석이 완료되었습니다. ✅`, "success");
+          setIsProcessing(false);
+          setProcessingFileName('');
+          clearInterval(intervalId);
+        }
+      } catch {
+        if (attempts >= maxAttempts) clearInterval(intervalId);
       }
     }, 3000);
   };

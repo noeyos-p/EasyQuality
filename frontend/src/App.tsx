@@ -30,6 +30,17 @@ function App() {
   const [isComparing, setIsComparing] = useState(false)
   const [diffData, setDiffData] = useState<any>(null)
 
+  // 🆕 전역 알림(Toast) 상태
+  const [toasts, setToasts] = useState<{ id: string, message: string, type: 'success' | 'error' | 'info' }[]>([])
+
+  const addToast = (message: string, type: 'success' | 'error' | 'info' = 'success') => {
+    const id = Math.random().toString(36).substr(2, 9)
+    setToasts(prev => [...prev, { id, message, type }])
+    setTimeout(() => {
+      setToasts(prev => prev.filter(t => t.id !== id))
+    }, 5000)
+  }
+
   // 백엔드 연결 확인
   useEffect(() => {
     const checkBackendStatus = async () => {
@@ -78,24 +89,32 @@ function App() {
 
   const handleSaveDocument = async () => {
     if (!selectedDocument) return
-    setIsSaving(true)
+    setIsSaving(true) // 버튼 비활성화용
     try {
       const response = await fetch(`${API_URL}/rag/document/save`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ doc_name: selectedDocument, content: editedContent }),
       })
+
+      const data = await response.json()
+
       if (response.ok) {
-        const data = await response.json()
+        addToast(`'${selectedDocument}' 수정 요청이 접수되었습니다. 배경 분석 중...`, 'info')
         setDocumentContent(editedContent)
         setIsEditing(false)
-        alert(`문서가 저장되었습니다. (새 버전: ${data.version})`)
+
+        // 🆕 비동기 완료 감지를 위한 이벤트 발송 (DocumentManagementPanel 등에서 수신 가능)
+        window.dispatchEvent(new CustomEvent('document_processing_start', {
+          detail: { docName: selectedDocument, type: 'save' }
+        }))
+
       } else {
-        const errorData = await response.json()
-        alert(`저장 실패: ${errorData.detail || '알 수 없는 오류'}`)
+        addToast(`저장 요청 실패: ${data.detail || '알 수 없는 오류'}`, 'error')
       }
-    } catch {
-      alert('저장 중 오류가 발생했습니다.')
+    } catch (error) {
+      console.error('저장 에러:', error)
+      addToast('저장 중 연결 오류가 발생했습니다.', 'error')
     } finally {
       setIsSaving(false)
     }
@@ -186,7 +205,10 @@ function App() {
         {/* 사이드 패널 */}
         <div className={`flex-shrink-0 bg-dark-deeper border-r border-dark-border flex flex-col overflow-hidden transition-[width,opacity,border-color] duration-300 ease-in-out ${!isLeftVisible || !activePanel || activePanel === 'visualization' ? 'w-0 opacity-0 border-r-transparent pointer-events-none' : 'w-80'}`}>
           {activePanel === 'documents' && (
-            <DocumentManagementPanel onDocumentSelect={handleDocumentSelect} />
+            <DocumentManagementPanel
+              onDocumentSelect={handleDocumentSelect}
+              onNotify={addToast}
+            />
           )}
           {activePanel === 'history' && (
             <ChangeHistoryPanel onCompare={handleCompare} selectedDocName={selectedDocument} />
@@ -254,16 +276,35 @@ function App() {
         />
       </div>
 
-      {/* 저장 중 오버레이 */}
-      {isSaving && (
-        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-[2000]">
-          <div className="bg-[#2d2d2d] border border-dark-border rounded-lg p-8 flex flex-col items-center gap-4 text-center">
-            <div className="w-10 h-10 border-4 border-dark-border border-t-accent-blue rounded-full animate-spin"></div>
-            <p className="text-txt-primary text-[14px] m-0">문서를 분석하고 저장하는 중입니다...</p>
-            <span className="text-txt-secondary text-[12px]">이 작업은 최대 1분 정도 소요될 수 있습니다.</span>
+      {/* 🆕 품격 있는 Toast 알림 */}
+      <div className="fixed top-12 right-6 z-[3000] flex flex-col gap-3 pointer-events-none">
+        {toasts.map(toast => (
+          <div
+            key={toast.id}
+            className={`pointer-events-auto min-w-[300px] p-4 rounded-lg shadow-2xl border flex items-center gap-3 animate-slide-in-right
+              ${toast.type === 'success' ? 'bg-[#1e1e1e] border-[#4ec9b0] text-[#4ec9b0]' :
+                toast.type === 'error' ? 'bg-[#1e1e1e] border-[#f48771] text-[#f48771]' :
+                  'bg-[#1e1e1e] border-accent-blue text-accent-blue'}`}
+          >
+            <span className="text-[18px]">
+              {toast.type === 'success' ? '✓' : toast.type === 'error' ? '⚠' : 'ℹ'}
+            </span>
+            <div className="flex-1">
+              <p className="m-0 text-[13px] font-medium leading-normal">{toast.message}</p>
+            </div>
           </div>
-        </div>
-      )}
+        ))}
+      </div>
+
+      <style>{`
+        @keyframes slide-in-right {
+          from { transform: translateX(100%); opacity: 0; }
+          to { transform: translateX(0); opacity: 1; }
+        }
+        .animate-slide-in-right {
+          animation: slide-in-right 0.3s ease-out forwards;
+        }
+      `}</style>
     </div>
   )
 }

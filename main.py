@@ -391,50 +391,42 @@ app.add_middleware(
 )
 
 
-@app.post("/rag/document/save")
-async def save_document_content(request: SaveDocRequest):
+
+def process_save_task(
+    doc_name: str,
+    content: str,
+    collection: str,
+    model: str
+):
     """
-    수정된 문서 내용을 저장하고 DB 동기화
-    1. 본문에서 버전 추출 (재분석)
-    2. RDB에 신규 버전 INSERT
-    3. 기존 그래프/벡터 DB 삭제 후 재업로드 (Overwrite)
+    문서 수정을 수행하는 배경 작업 함수
     """
     start_time = time.time()
-    doc_name = request.doc_name
-    content = request.content
-    
-    print(f"\n{'='*70}")
-    print(f"문서 수정 저장 [V2]: {doc_name}")
-    print(f"{'='*70}\n")
-    
     try:
-        # 1. 문서 재분석 (파이프라인 재사용)
-        print(f"[1단계] 수정본 분석 및 버전 추출")
-        content_bytes = content.encode('utf-8')
+        print(f"\n[Background Task] 문서 수정 저장 처리 시작: {doc_name}")
         
-        model_path = resolve_model_path(request.model)
+        # 1. 문서 재분석 (파이프라인 재사용)
+        content_bytes = content.encode('utf-8')
+        model_path = resolve_model_path(model)
         embed_model = SentenceTransformer(model_path)
         
-        # 파이프라인 실행
         result = process_document(
             file_path=f"{doc_name}.md",
             content=content_bytes,
-            use_llm_metadata=True, # 메타데이터 및 버전 추출을 위해 활성화
+            use_llm_metadata=True,
             embed_model=embed_model
         )
         
         if not result.get("success"):
-            raise HTTPException(400, f"🔴 분석 실패: {result.get('errors')}")
+            print(f"  🔴 [Task 실패] 분석 실패: {result.get('errors')}")
+            return
             
         final_version = result.get("version", "1.0")
         chunks_data = result["chunks"]
         doc_id = result.get("doc_id", doc_name)
         
-        print(f"  🟢 분석 완료: 버전 {final_version} 감지됨\n")
-        
-        # 2. 기존 검색 데이터 삭제 (Overwrite 정제)
-        print(f"[2단계] 기존 검색 인덱스 삭제 (Overwrite 준비)")
-        vector_store.delete_by_doc_name(doc_name, collection_name=request.collection)
+        # 2. 기존 검색 데이터 삭제
+        vector_store.delete_by_doc_name(doc_name, collection_name=collection)
         
         try:
             graph = get_graph_store()
@@ -444,14 +436,11 @@ async def save_document_content(request: SaveDocRequest):
                     sop_match = re.search(r'([A-Z]+-[A-Z]+-\d+)', doc_name, re.IGNORECASE)
                     if sop_match:
                         sop_id = sop_match.group(1).upper()
-                
                 graph.delete_document(sop_id)
-                print(f"  🟢 Neo4j 기존 데이터 삭제 완료 ({sop_id})")
         except Exception as ge:
-            print(f"  ⚠ Neo4j 삭제 실패 (무시): {ge}")
+            print(f"  ⚠ Neo4j 삭제 실패: {ge}")
 
         # 3. RDB 신규 버전 저장
-        print(f"\n[3단계] PostgreSQL 신규 버전 저장")
         doc_id_db = sql_store.save_document(
             doc_name=doc_name,
             content=content,
@@ -469,55 +458,62 @@ async def save_document_content(request: SaveDocRequest):
                 for c in chunks_data
             ]
             sql_store.save_chunks_batch(doc_id_db, batch_chunks)
-            print(f"  🟢 RDB 저장 완료\n")
         
         # 4. 벡터 DB 재업로드
-        print(f"[4단계] Weaviate 벡터 재업로드")
         texts = [c["text"] for c in chunks_data]
-        metadatas = [
-            {
-                **c["metadata"],
-                "chunk_method": "article",
-                "model": request.model,
-                "pipeline_version": "edit-save-v2.0", # 버전 상향
-            }
-            for c in chunks_data
-        ]
+        metadatas = [{**c["metadata"], "chunk_method": "article", "model": model, "pipeline_version": "edit-save-v14.0"} for c in chunks_data]
         
         vector_store.add_documents(
             texts=texts,
             metadatas=metadatas,
-            collection_name=request.collection,
+            collection_name=collection,
             model_name=model_path
         )
-        print(f"  🟢 벡터 저장 완료\n")
         
         # 5. 그래프 DB 재업로드
-        print(f"[5단계] Neo4j 그래프 재업로드")
         try:
             graph = get_graph_store()
             if graph.test_connection():
                 _upload_to_neo4j_from_pipeline(graph, result, f"{doc_name}.md")
-                print(f"  🟢 그래프 저장 완료\n")
-        except Exception as ge:
-            print(f"  ⚠ Neo4j 업로드 실패 (무시): {ge}")
+        except: pass
             
         elapsed = round(time.time() - start_time, 2)
-        print(f"{'='*70}")
-        print(f"🟢 수정 저장 완료 [V2] ({elapsed}초)")
-        print(f"{'='*70}\n")
+        print(f"\n[Background Task] 🟢 수정 저장 완료 ({elapsed}초): {doc_name}")
         
+    except Exception as e:
+        print(f"  🔴 [Background Task 에러] {str(e)}")
+        import traceback
+        traceback.print_exc()
+
+
+@app.post("/rag/document/save")
+async def save_document_content(background_tasks: BackgroundTasks, request: SaveDocRequest):
+    """
+    수정된 문서 내용을 저장하고 DB 동기화 (비동기 v14.0)
+    """
+    try:
+        print(f"\n{'='*70}")
+        print(f"문서 수정 저장 요청 접수: {request.doc_name}")
+        print(f"  처리 방식: 비동기 (Background Tasks)")
+        print(f"{'='*70}\n")
+
+        background_tasks.add_task(
+            process_save_task,
+            doc_name=request.doc_name,
+            content=request.content,
+            collection=request.collection,
+            model=request.model
+        )
+
         return {
             "success": True,
-            "doc_name": doc_name,
-            "version": final_version,
-            "elapsed": elapsed
+            "message": f"'{request.doc_name}' 문서의 수정 사항이 접수되었습니다. 분석 및 동기화가 배경에서 진행됩니다.",
+            "doc_name": request.doc_name,
+            "processing_mode": "background"
         }
         
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(500, f"저장 중 오류 발생: {str(e)}")
+        raise HTTPException(500, f"저장 요청 실패: {str(e)}")
 
 
 
