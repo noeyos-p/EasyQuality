@@ -12,7 +12,7 @@ RAG 챗봇 API v14.0 + Agent (OpenAI)
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
@@ -607,48 +607,32 @@ def list_llm_models():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  API 엔드포인트 - 업로드 (LangGraph v9.2)
+# ═══════════════════════════════════════════════════════════════════════════
+#  API 엔드포인트 - 업로드 (LangGraph v9.2 - 비동기 배경 작업)
 # ═══════════════════════════════════════════════════════════════════════════
 
-@app.post("/rag/upload")
-async def upload_document(
-    file: UploadFile = File(...),
-    collection: str = Form("documents"),
-    chunk_size: int = Form(DEFAULT_CHUNK_SIZE),
-    chunk_method: str = Form(DEFAULT_CHUNK_METHOD),
-    model: str = Form("multilingual-e5-small"),
-    overlap: int = Form(DEFAULT_OVERLAP),
-    use_langgraph: bool = Form(True),  #  LangGraph 사용 여부
-    use_llm_metadata: bool = Form(True),  #  LLM 메타데이터 추출 사용 여부
-    version: Optional[str] = Form(None), # 사용자가 직접 지정하는 버전
+def process_upload_task(
+    filename: str,
+    content: bytes,
+    collection: str,
+    chunk_size: int,
+    chunk_method: str,
+    model: str,
+    overlap: int,
+    use_langgraph: bool,
+    use_llm_metadata: bool,
+    version: Optional[str] = None
 ):
     """
-    문서 업로드 (LangGraph v9.2 파이프라인)
-    
-    - ChromaDB에 벡터 저장
-    - Neo4j에 그래프 저장
-    - 페이지 번호, Parent-Child 계층 메타데이터 포함
+    문서 처리를 수행하는 배경 작업 함수
     """
     start_time = time.time()
-    
     try:
-        content = await file.read()
-        filename = file.filename
+        print(f"\n[Background Task] 문서 업로드 처리 시작: {filename}")
         
-        print(f"\n{'='*70}")
-        print(f"문서 업로드: {filename}")
-        print(f"{'='*70}\n")
-
         # ========================================
         # 문서 파싱
         # ========================================
-        print(f"[1단계] 문서 파싱")
-        print(f"  파이프라인: PDF 조항 v2.0")
-        print(f"  LLM 메타데이터: {'🟢 활성' if use_llm_metadata else '비활성'}")
-        if use_llm_metadata:
-            print(f"  LLM 모델: gpt-4o-mini")
-        print()
-
         model_path = resolve_model_path(model)
         embed_model = SentenceTransformer(model_path)
 
@@ -661,35 +645,24 @@ async def upload_document(
 
         if not result.get("success"):
             errors = result.get("errors", ["알 수 없는 오류"])
-            raise HTTPException(400, f"🔴 문서 처리 실패: {errors}")
+            print(f"  🔴 [Task 실패] 문서 처리 실패: {errors}")
+            return
 
         chunks_data = result["chunks"]
         if not chunks_data:
-            raise HTTPException(400, "🔴 텍스트 추출 실패")
-
-        from dataclasses import dataclass
-        @dataclass
-        class Chunk:
-            text: str
-            metadata: dict
-            index: int = 0
+            print("  🔴 [Task 실패] 텍스트 추출 실패")
+            return
 
         chunks = [Chunk(text=c["text"], metadata=c["metadata"], index=c["index"]) for c in chunks_data]
         doc_id = result.get("doc_id")
         doc_title = result.get("doc_title")
         pipeline_version = "pdf-clause-v2.0"
 
-        print(f"  🟢 파싱 완료")
-        print(f"     • ID: {doc_id}")
-        print(f"     • 제목: {doc_title}")
-        print(f"     • 조항: {result.get('total_clauses')}개")
-        print(f"     • 청크: {len(chunks)}개\n")
+        print(f"  🟢 파싱 완료: {doc_id} ({len(chunks)}개 청크)")
         
         # ========================================
         # Weaviate 벡터 저장
         # ========================================
-        print(f"[2단계] Weaviate 벡터 저장")
-
         texts = [c.text for c in chunks]
         metadatas = [
             {
@@ -707,29 +680,21 @@ async def upload_document(
             collection_name=collection,
             model_name=model_path
         )
-        print(f"  🟢 저장 완료: {len(chunks)}개 청크\n")
+        print(f"  🟢 Weaviate 저장 완료")
         
         # ========================================
         # PostgreSQL 문서 저장
         # ========================================
-        print(f"[3단계] PostgreSQL 저장")
-
         try:
-            # PDF에서 추출한 원본 텍스트 그대로 사용 (조항 번호 포함)
             original_text = result.get("markdown", "")
             if not original_text:
-                # fallback: 청크들을 합침
                 original_text = "\n\n".join([c.text for c in chunks])
 
-            # 파이프라인에서 추출된 버전 또는 사용자 입력 버전 결정
             final_version = version or result.get("version", "1.0")
             
-            if final_version != "1.0":
-                print(f"     [추출] 최종 결정된 버전: {final_version}")
-
             doc_id_db = sql_store.save_document(
                 doc_name=doc_id,
-                content=original_text,  # PDF 원본 텍스트 그대로 저장
+                content=original_text,
                 doc_type=filename.split('.')[-1] if '.' in filename else None,
                 version=final_version
             )
@@ -744,66 +709,83 @@ async def upload_document(
                     for c in chunks
                 ]
                 sql_store.save_chunks_batch(doc_id_db, batch_chunks)
-                print(f"  🟢 저장 완료: 문서 + {len(chunks)}개 청크\n")
-            else:
-                print(f"  🔴 저장 실패: DB 저장에 실패했습니다 (ID 생성 불가)\n")
+                print(f"  🟢 PostgreSQL 저장 완료")
         except Exception as sql_err:
-            print(f"  🔴 저장 실패: {sql_err}\n")
+            print(f"  🔴 PostgreSQL 저장 실패: {sql_err}")
 
         # ========================================
         # Neo4j 그래프 저장
         # ========================================
-        print(f"[4단계] Neo4j 그래프 저장")
-        graph_uploaded = False
-        graph_sections = 0
-
         try:
-            from backend.graph_store import Neo4jGraphStore
-
             graph = get_graph_store()
             if graph.test_connection():
                 _upload_to_neo4j_from_pipeline(graph, result, filename)
-                graph_uploaded = True
-                stats = graph.get_graph_stats()
-                graph_sections = stats.get("sections", 0)
-                print(f"  🟢 저장 완료: {graph_sections}개 섹션\n")
+                print(f"  🟢 Neo4j 저장 완료")
         except Exception as graph_error:
-            # [디버그 로그 보강] 연결 실패 시 구체적인 에러 메시지 출력
-            print(f"  🔴 Neo4j 연결 실패: {graph_error}")
-            import traceback
-            traceback.print_exc()
-            print(f"  ⚠ 그래프 연동을 건너뛰고 계속 진행합니다.\n")
+            print(f"  🔴 Neo4j 저장 실패: {graph_error}")
         
-        # ========================================
-        # 완료
-        # ========================================
         elapsed = round(time.time() - start_time, 2)
+        print(f"\n[Background Task] 🟢 업로드 처리 완료 ({elapsed}초): {filename}")
 
-        print(f"{'='*70}")
-        print(f"🟢 업로드 완료 ({elapsed}초)")
+    except Exception as e:
+        print(f"  🔴 [Background Task 에러] {str(e)}")
+        import traceback
+        traceback.print_exc()
+
+@app.post("/rag/upload")
+async def upload_document(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    collection: str = Form("documents"),
+    chunk_size: int = Form(DEFAULT_CHUNK_SIZE),
+    chunk_method: str = Form(DEFAULT_CHUNK_METHOD),
+    model: str = Form("multilingual-e5-small"),
+    overlap: int = Form(DEFAULT_OVERLAP),
+    use_langgraph: bool = Form(True),
+    use_llm_metadata: bool = Form(True),
+    version: Optional[str] = Form(None),
+):
+    """
+    문서 업로드 (비동기 배경 작업 v14.0)
+    
+    - 파일을 즉시 수신하고 배경 작업으로 처리를 넘김
+    - 사용자는 즉시 성공 응답을 받음
+    """
+    try:
+        content = await file.read()
+        filename = file.filename
+        
+        print(f"\n{'='*70}")
+        print(f"문서 업로드 요청 접수: {filename}")
+        print(f"  처리 방식: 비동기 (Background Tasks)")
         print(f"{'='*70}\n")
+
+        # 배경 작업 등록
+        background_tasks.add_task(
+            process_upload_task,
+            filename=filename,
+            content=content,
+            collection=collection,
+            chunk_size=chunk_size,
+            chunk_method=chunk_method,
+            model=model,
+            overlap=overlap,
+            use_langgraph=use_langgraph,
+            use_llm_metadata=use_llm_metadata,
+            version=version
+        )
 
         return {
             "success": True,
+            "message": f"'{filename}' 문서의 업로드가 시작되었습니다. 처리가 완료되는 동안 다른 작업을 수행하실 수 있습니다.",
             "filename": filename,
-            "doc_id": doc_id,
-            "doc_title": doc_title,
-            "version": final_version,
-            "chunks": len(chunks),
-            "total_clauses": result.get("total_clauses"),
-            "chunk_method": chunk_method,
-            "pipeline_version": pipeline_version,
-            "graph_uploaded": graph_uploaded,
-            "elapsed_seconds": elapsed,
-            "sample_metadata": metadatas[0] if metadatas else {},
+            "processing_mode": "background"
         }
 
-    except HTTPException:
-        raise
     except Exception as e:
         import traceback
         traceback.print_exc()
-        raise HTTPException(500, f"🔴 실패: {str(e)}")
+        raise HTTPException(500, f"🔴 요청 실패: {str(e)}")
 
 
 def _upload_to_neo4j_from_pipeline(graph, result: dict, filename: str):
