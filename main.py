@@ -20,6 +20,7 @@ from typing import List, Dict, Optional, Literal
 from contextlib import asynccontextmanager
 import torch
 import time
+import asyncio
 import re
 import uuid
 import json
@@ -113,6 +114,9 @@ PRESET_MODELS = {
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 chat_histories: Dict[str, List[Dict]] = {}
+chat_results: Dict[str, Dict] = {}  # 🆕 비동기 채팅 결과 저장소
+chat_queue: asyncio.Queue = asyncio.Queue()  # 🆕 순차 처리를 위한 대기열
+chat_pending_ids: List[str] = []  # 🆕 현재 대기 중인 요청 ID 목록 (순번 계산용)
 _graph_store = None
 
 def get_graph_store():
@@ -145,9 +149,19 @@ except ImportError as e:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
+    print("🚀 채팅 워커(Worker) 가동 중...")
+    worker_task = asyncio.create_task(chat_worker())
+    
     yield
+    
     # Shutdown
     print("\n 서버 종료 중...")
+    worker_task.cancel()
+    try:
+        await worker_task
+    except asyncio.CancelledError:
+        print(" 채팅 워커 종료됨")
+        
     vector_store.close_client()
     if _graph_store:
         _graph_store.close()
@@ -805,105 +819,122 @@ def _upload_to_neo4j_from_pipeline(graph, result: dict, filename: str):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# API 엔드포인트 - 챗봇
+# API 엔드포인트 - 챗봇 (순차 대기열 처리 v14.1)
 # ═══════════════════════════════════════════════════════════════════════════
 
-@app.post("/chat")
-def chat(request: ChatRequest):
+async def chat_worker():
     """
-    Main Agent Chat Endpoint
-    - Manual RAG 로직 제거됨
-    - 오직 Agent Orchestrator를 통해서만 답변
+    큐에서 질문을 하나씩 꺼내어 순차적으로 답변을 생성하는 워커
     """
-    print(f" [Agent] 요청 수신: {request.message}")
-    
-    try:
-        # Agent 실행
-        # llm.py 업데이트에 따라 model_name 파라미터 등을 적절히 전달
-        init_agent_tools(vector_store, get_graph_store(), sql_store)
-        
-        response = run_agent(
-            query=request.message,
-            session_id=request.session_id or str(uuid.uuid4()),
-            model_name=request.llm_model or "gpt-4o-mini"
-        )
-
-        answer = response.get("answer")
-
-        # LLM as a Judge 평가
-        evaluation_scores = None
-
-        # 에러 메시지 패턴 감지
-        error_patterns = ["오류가 발생", "에러", "실패", "Error", "Exception", "찾을 수 없", "준비하지 못", "로딩 에러"]
-        is_error_message = any(pattern in answer for pattern in error_patterns)
-
+    while True:
+        request_id, request = await chat_queue.get()
         try:
-            from backend.evaluation import AgentEvaluator
+            print(f" 🚀 [Chat Worker] 처리 시작: {request_id}")
+            # 🆕 처리 시작 시 순번 정보 제거 및 상태 변경
+            chat_results[request_id] = {"status": "processing", "result": None}
+            if "position" in chat_results[request_id]:
+                del chat_results[request_id]["position"]
+            
+            # 현재 대기 목록에서 제거
+            if request_id in chat_pending_ids:
+                chat_pending_ids.remove(request_id)
 
-            # 평가 생략 조건
-            if len(answer) < 20:
-                print("평가 생략: 답변이 너무 짧음")
-            elif is_error_message:
-                print("평가 생략: 에러 메시지")
-            else:
-                # 평가 실행 (RDB 검증 필수!)
-                evaluator = AgentEvaluator(
-                    judge_model="gpt-4o-mini",
-                    sql_store=sql_store  # ✅ RDB 검증을 위해 필수 전달
-                )
-
-                # context 추출 (agent_log에서)
-                context = response.get("agent_log", {}).get("context", "")
-                if isinstance(context, list):
-                    context = "\n\n".join(context)
-
-                evaluation_scores = evaluator.evaluate_single(
-                    question=request.message,
-                    answer=answer,
-                    context=context,
-                    metrics=["faithfulness", "groundness", "relevancy", "correctness"]
-                )
-
-                # 로그 출력
-                if evaluation_scores:
-                    print(f"\n{'='*60}")
-                    print(f"평가 결과 (평균: {evaluation_scores.get('average_score', 0)}/5)")
-                    print(f"{'='*60}")
-                    for metric, result in evaluation_scores.items():
-                        # average_score는 건너뜀 (float이므로 .get() 메서드 없음)
-                        if metric == "average_score":
-                            continue
-
-                        score = result.get("score", 0)
-                        reasoning = result.get("reasoning", "")
-                        print(f"\n[{metric.upper()}]")
-                        print(f"  점수: {score}/5")
-                        print(f"  이유: {reasoning}")
-
-                        # RDB 검증 결과 출력
-                        if "rdb_verification" in result:
-                            rdb = result["rdb_verification"]
-                            print(f"  📊 RDB 검증: 정확도 {rdb.get('accuracy_rate', 0)}% ({rdb.get('verified_citations', 0)}/{rdb.get('total_citations', 0)})")
-                    print(f"{'='*60}\n")
-
-        except ImportError:
-            print("평가 모듈 사용 불가 (선택적 기능)")
-        except Exception as eval_error:
-            print(f"평가 실행 실패 (계속 진행): {eval_error}")
+            # Agent 실행 (이벤트 루프 차단을 방지하기 위해 별도 스레드에서 실행)
+            # v14.1.1: asyncio.to_thread 도입 (문서 목록 사라짐 등 UI 차단 해결)
+            from backend.agent import run_agent, init_agent_tools
+            init_agent_tools(vector_store, get_graph_store(), sql_store)
+            
+            response = await asyncio.to_thread(
+                run_agent,
+                query=request.message,
+                session_id=request.session_id or str(uuid.uuid4()),
+                model_name=request.llm_model or "gpt-4o-mini"
+            )
+            
+            answer = response.get("answer")
+            
             evaluation_scores = None
+            error_patterns = ["오류가 발생", "에러", "실패", "Error", "Exception", "찾을 수 없", "준비하지 못", "로딩 에러"]
+            is_error_message = any(pattern in answer for pattern in error_patterns)
+            
+            try:
+                from backend.evaluation import AgentEvaluator
+                if len(answer) >= 20 and not is_error_message:
+                    evaluator = AgentEvaluator(judge_model="gpt-4o-mini", sql_store=sql_store)
+                    context = response.get("agent_log", {}).get("context", "")
+                    if isinstance(context, list): context = "\n\n".join(context)
+                    
+                    evaluation_scores = evaluator.evaluate_single(
+                        question=request.message,
+                        answer=answer,
+                        context=context,
+                        metrics=["faithfulness", "groundness", "relevancy", "correctness"]
+                    )
+            except Exception as eval_error:
+                print(f"  평가 실행 실패: {eval_error}")
+                
+            result_data = {
+                "session_id": request.session_id,
+                "answer": answer,
+                "sources": [],
+                "agent_log": response,
+                "evaluation_scores": evaluation_scores
+            }
+            
+            chat_results[request_id] = {"status": "completed", "result": result_data}
+            print(f" ✅ [Chat Worker] 처리 완료: {request_id}")
+            
+        except Exception as e:
+            print(f" 🔴 [Chat Worker] 에러: {e}")
+            chat_results[request_id] = {"status": "error", "error": str(e)}
+            if request_id in chat_pending_ids:
+                chat_pending_ids.remove(request_id)
+        finally:
+            chat_queue.task_done()
 
-        return {
-            "session_id": request.session_id,
-            "answer": answer,
-            "sources": [],
-            "agent_log": response,
-            "evaluation_scores": evaluation_scores
-        }
-    except Exception as e:
-        print(f" [Agent] 에러: {e}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(500, str(e))
+@app.post("/chat")
+async def chat(request: ChatRequest):
+    """
+    순차 대기열 채팅 엔드포인트
+    - 요청을 즉시 큐에 담고 대기 순번을 반환할 수 있도록 준비
+    """
+    request_id = str(uuid.uuid4())
+    print(f" [Agent] 대기열 등록: {request_id}")
+    
+    # 상태 초기화
+    chat_results[request_id] = {"status": "waiting", "result": None}
+    chat_pending_ids.append(request_id)
+    
+    # 큐에 추가
+    await chat_queue.put((request_id, request))
+    
+    # 현재 대기 순번 계산 (자신 포함)
+    position = chat_pending_ids.index(request_id) + 1
+    
+    return {
+        "success": True,
+        "request_id": request_id,
+        "message": f"질문이 대기열에 등록되었습니다. (현재 대기 순번: {position}번째)",
+        "status": "waiting",
+        "position": position
+    }
+
+@app.get("/chat/status/{request_id}")
+async def get_chat_status(request_id: str):
+    """채팅 작업의 상태와 대기 순번 조회"""
+    if request_id not in chat_results:
+        raise HTTPException(404, "요청 ID를 찾을 수 없습니다.")
+    
+    status_data = chat_results[request_id].copy() # 🆕 원본 데이터 보호를 위해 복사본 반환
+    
+    # 대기 중인 경우 실시간 순번 업데이트
+    if status_data["status"] == "waiting" and request_id in chat_pending_ids:
+        status_data["position"] = chat_pending_ids.index(request_id) + 1
+    else:
+        # 🆕 대기 중이 아니면 순속 정보 제거
+        status_data.pop("position", None)
+    
+    return status_data
 
 
 

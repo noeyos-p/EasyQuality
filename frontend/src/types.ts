@@ -30,12 +30,16 @@ export interface EvaluationScores {
 }
 
 export interface ChatMessage {
+  id?: string // 🆕 메시지 고유 식별자
   role: 'user' | 'assistant'
   content: string
   timestamp: Date
   thoughtProcess?: string
   thinkingTime?: number
   evaluation_scores?: EvaluationScores
+  isWaiting?: boolean  // 🆕 레거시 호환용 (제거 예정)
+  queuePosition?: number // 🆕 대기 순번
+  status?: 'waiting' | 'processing' | 'completed' | 'error' // 🆕 상세 상태
 }
 
 export const API_URL = 'http://localhost:8000'
