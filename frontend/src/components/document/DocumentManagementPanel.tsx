@@ -39,6 +39,10 @@ export default function DocumentManagementPanel({ onDocumentSelect }: DocumentMa
   const [uploadProgress, setUploadProgress] = useState<string>('');
   const [isDeleting, setIsDeleting] = useState(false);
 
+  // 🆕 배경 처리 상태 관리
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [processingFileName, setProcessingFileName] = useState<string>('');
+
   // 문서 목록 로드
   useEffect(() => {
     fetchDocuments();
@@ -97,6 +101,8 @@ export default function DocumentManagementPanel({ onDocumentSelect }: DocumentMa
       // 새 문서가 추가되었거나 최대 시도 횟수에 도달하면 폴링 중단
       if (currentCount > initialCount || attempts >= maxAttempts) {
         clearInterval(intervalId);
+        setIsProcessing(false); // 🆕 처리 완료 표시
+        setProcessingFileName('');
         console.log(currentCount > initialCount ? "✅ [Polling] 새 문서 감지됨!" : "⏱️ [Polling] 최대 시간 도달로 종료");
       }
     }, 3000);
@@ -217,6 +223,11 @@ export default function DocumentManagementPanel({ onDocumentSelect }: DocumentMa
           setIsUploadModalOpen(false);
           setUploadFile(null);
           setUploadProgress('');
+
+          // 🆕 배경 처리 상태 시작
+          setIsProcessing(true);
+          setProcessingFileName(uploadFile.name);
+
           // 🆕 비동기 처리가 완료되어 리스트에 나타날 때까지 폴링 시작
           startPolling(currentCount);
         }, 1500);
@@ -397,6 +408,25 @@ export default function DocumentManagementPanel({ onDocumentSelect }: DocumentMa
               </button>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* 🆕 배경 작업 상태 표시 바 (Tailwind 전용 토큰 사용) */}
+      {isProcessing && (
+        <div className="fixed bottom-6 right-6 flex items-center gap-3 bg-dark-light border border-dark-border px-4 py-3 rounded-lg shadow-2xl z-[2000] animate-pulse">
+          {/* 스피너 아이콘 */}
+          <div className="w-4 h-4 border-2 border-accent-blue border-t-transparent rounded-full animate-spin" />
+          <div className="flex flex-col">
+            <span className="text-[13px] text-txt-primary font-medium line-height-[1.2]">문서 처리 중...</span>
+            <span className="text-[11px] text-txt-secondary truncate max-w-[200px]">{processingFileName}</span>
+          </div>
+          {/* 닫기 버튼 (옵션: 폴링은 계속됨) */}
+          <button
+            className="ml-2 text-txt-muted hover:text-txt-primary text-[14px]"
+            onClick={() => setIsProcessing(false)}
+          >
+            ×
+          </button>
         </div>
       )}
     </div>
