@@ -30,7 +30,7 @@ interface DocumentManagementPanelProps {
   onNotify?: (message: string, type?: 'success' | 'error' | 'info') => void; // 🆕 알림 트리거용 프롭스
 }
 
-export default function DocumentManagementPanel({ onDocumentSelect }: DocumentManagementPanelProps) {
+export default function DocumentManagementPanel({ onDocumentSelect, onNotify }: DocumentManagementPanelProps) {
   const [groupedDocuments, setGroupedDocuments] = useState<Map<string, DocumentGroup>>(new Map());
   const [selectedDoc, setSelectedDoc] = useState<string | null>(null);
   const [versions, setVersions] = useState<Version[]>([]);
@@ -136,7 +136,7 @@ export default function DocumentManagementPanel({ onDocumentSelect }: DocumentMa
       // 버전 목록 조회
       try {
         const res = await fetch(`${API_URL}/rag/document/${docName}/versions`);
-        const data = await res.json();
+        await res.json();
         // 단순히 시간 기반 또는 성공 응답 여부로 처리해도 되지만, 여기서는 fetchDocuments로 전체 갱신 유도
         await fetchDocuments();
 

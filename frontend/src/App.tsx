@@ -164,16 +164,18 @@ function App() {
               ) : (
                 <>
                   <button
-                    className="bg-dark-hover border border-dark-border text-[#f48fb1] py-1 px-3 text-[11px] rounded cursor-pointer transition-all duration-200 hover:bg-dark-border hover:border-txt-secondary"
+                    className="bg-dark-hover border border-dark-border text-[#f48fb1] py-1 px-3 text-[11px] rounded cursor-pointer transition-all duration-200 hover:bg-dark-border hover:border-txt-secondary disabled:opacity-50 disabled:cursor-not-allowed"
                     onClick={() => { setIsEditing(false); setEditedContent(documentContent || '') }}
+                    disabled={isSaving}
                   >
                     취소
                   </button>
                   <button
-                    className="bg-accent-blue text-white border-accent-blue py-1 px-3 text-[11px] rounded cursor-pointer transition-all duration-200 hover:bg-[#0062a3]"
+                    className="bg-accent-blue text-white border-accent-blue py-1 px-3 text-[11px] rounded cursor-pointer transition-all duration-200 hover:bg-[#0062a3] disabled:opacity-50 disabled:cursor-not-allowed"
                     onClick={handleSaveDocument}
+                    disabled={isSaving}
                   >
-                    저장
+                    {isSaving ? '저장 중...' : '저장'}
                   </button>
                 </>
               )}
