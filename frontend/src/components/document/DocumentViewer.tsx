@@ -1,4 +1,5 @@
 import React from 'react'
+import { API_URL } from '../../types'
 
 interface DocumentViewerProps {
   selectedDocument: string
@@ -10,6 +11,7 @@ interface DocumentViewerProps {
   onlyOfficeEditorMode?: 'view' | 'edit'
   onlyOfficeConfig?: object | null
   onlyOfficeServerUrl?: string
+  onClose?: () => void
 }
 
 export default function DocumentViewer({
@@ -22,12 +24,12 @@ export default function DocumentViewer({
   onlyOfficeEditorMode = 'view',
   onlyOfficeConfig = null,
   onlyOfficeServerUrl = '',
+  onClose,
 }: DocumentViewerProps) {
   const [isDownloadOpen, setIsDownloadOpen] = React.useState(false)
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const editorInstanceRef = React.useRef<any>(null)
 
-  // Suppress unused warning - will be used when OnlyOffice config is implemented
   void onlyOfficeEditorMode
 
   // OnlyOffice 에디터 초기화
@@ -38,7 +40,6 @@ export default function DocumentViewer({
     const scriptSrc = `${onlyOfficeServerUrl}/web-apps/apps/api/documents/api.js`
 
     const initEditor = () => {
-      // 이전 인스턴스 파괴
       if (editorInstanceRef.current) {
         try { editorInstanceRef.current.destroyEditor() } catch (_) {}
         editorInstanceRef.current = null
@@ -53,7 +54,6 @@ export default function DocumentViewer({
       }
     }
 
-    // 스크립트가 이미 로드됐는지 확인
     const existingScript = document.querySelector(`script[src="${scriptSrc}"]`)
     if (existingScript) {
       initEditor()
@@ -68,7 +68,10 @@ export default function DocumentViewer({
 
   const handleDownload = async (format: 'pdf' | 'docx' | 'md') => {
     try {
-      const response = await fetch(`http://localhost:8000/rag/document/${selectedDocument}/download?format=${format}`)
+      const token = localStorage.getItem('auth_token')
+      const response = await fetch(`${API_URL}/rag/document/${selectedDocument}/download?format=${format}`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      })
       if (response.ok) {
         const blob = await response.blob()
         const url = window.URL.createObjectURL(blob)
@@ -107,7 +110,6 @@ export default function DocumentViewer({
       if (paragraphLines.length > 0) {
         const paragraphText = paragraphLines.join(' ')
         const totalPadding = globalDepth * indentIncrement
-
         elements.push(
           <p key={`para-${paragraphStartIdx}`} className="text-[15px] leading-[1.8] mb-[6px]" style={{ paddingLeft: `${totalPadding}px` }}>
             {paragraphText}
@@ -120,15 +122,11 @@ export default function DocumentViewer({
     lines.forEach((line, lineIdx) => {
       const trimmedLine = line.trim()
 
-      if (/^\*\*\*END OF DOCUMENT\*\*\*/.test(trimmedLine)) {
-        endOfDocumentReached = true
-        return
-      }
+      if (/^\*\*\*END OF DOCUMENT\*\*\*/.test(trimmedLine)) { endOfDocumentReached = true; return }
       if (endOfDocumentReached) return
       if (trimmedLine === '') return
 
       const sectionMatch = trimmedLine.match(/^(\d+(?:\.\d+)*)\.?\s+(.+)/)
-
       if (sectionMatch && /^of\s+\d+$/i.test(sectionMatch[2].trim())) return
 
       const isHeader = (
@@ -143,11 +141,8 @@ export default function DocumentViewer({
       )
 
       if (isHeader) {
-        if (!firstHeaderBlockPassed) {
-          inHeaderBlock = true
-        } else {
-          return
-        }
+        if (!firstHeaderBlockPassed) { inHeaderBlock = true }
+        else { return }
       } else if (inHeaderBlock) {
         inHeaderBlock = false
         firstHeaderBlockPassed = true
@@ -155,15 +150,12 @@ export default function DocumentViewer({
 
       if (sectionMatch) {
         flushParagraph()
-
         const sectionNum = sectionMatch[1]
         const sectionText = sectionMatch[2]
         const parts = sectionNum.split('.')
         globalDepth = parts.length - 1
-
         const displayText = `${sectionNum} ${sectionText}`
-        const sectionBasePadding = globalDepth * indentIncrement
-        const sectionStyle = { paddingLeft: `${sectionBasePadding}px` }
+        const sectionStyle = { paddingLeft: `${globalDepth * indentIncrement}px` }
 
         if (globalDepth === 0) {
           elements.push(
@@ -203,19 +195,14 @@ export default function DocumentViewer({
         const prevEnglish = (prevLine.match(/[a-zA-Z]/g)?.length || 0)
         const prevTotal = prevKorean + prevEnglish
         const wasPrevKorean = prevTotal > 0 && (prevKorean / prevTotal) > 0.3
-
         if (wasPrevKorean && isEnglishLine) {
           flushParagraph()
           paragraphStartIdx = lineIdx
         }
       }
 
-      if (paragraphLines.length === 0) {
-        paragraphStartIdx = lineIdx
-      }
+      if (paragraphLines.length === 0) paragraphStartIdx = lineIdx
       paragraphLines.push(trimmedLine)
-
-      // suppress unused warning
       void globalLastWasSection
     })
 
@@ -245,25 +232,15 @@ export default function DocumentViewer({
             >
               📥 Download <span className="opacity-50">▼</span>
             </button>
-
             {isDownloadOpen && (
               <div className="absolute right-0 mt-2 w-40 bg-dark-light border border-dark-border rounded shadow-2xl z-50 overflow-hidden">
-                <button
-                  className="w-full text-left px-4 py-2.5 text-[12px] text-txt-primary hover:bg-dark-hover transition-colors flex items-center gap-2"
-                  onClick={() => handleDownload('pdf')}
-                >
+                <button className="w-full text-left px-4 py-2.5 text-[12px] text-txt-primary hover:bg-dark-hover transition-colors flex items-center gap-2" onClick={() => handleDownload('pdf')}>
                   <span className="text-red-400">📄</span> PDF Document
                 </button>
-                <button
-                  className="w-full text-left px-4 py-2.5 text-[12px] text-txt-primary hover:bg-dark-hover border-t border-dark-border transition-colors flex items-center gap-2"
-                  onClick={() => handleDownload('docx')}
-                >
+                <button className="w-full text-left px-4 py-2.5 text-[12px] text-txt-primary hover:bg-dark-hover border-t border-dark-border transition-colors flex items-center gap-2" onClick={() => handleDownload('docx')}>
                   <span className="text-blue-400">📝</span> Word (.docx)
                 </button>
-                <button
-                  className="w-full text-left px-4 py-2.5 text-[12px] text-txt-primary hover:bg-dark-hover border-t border-dark-border transition-colors flex items-center gap-2"
-                  onClick={() => handleDownload('md')}
-                >
+                <button className="w-full text-left px-4 py-2.5 text-[12px] text-txt-primary hover:bg-dark-hover border-t border-dark-border transition-colors flex items-center gap-2" onClick={() => handleDownload('md')}>
                   <span className="text-green-400">markdown</span> Markdown (.md)
                 </button>
               </div>
@@ -274,11 +251,18 @@ export default function DocumentViewer({
 
       {/* 문서 내용 */}
       {isOnlyOfficeMode ? (
-        <div
-          id="onlyoffice-editor"
-          className="flex-1"
-          style={{ width: '100%' }}
-        />
+        <div className="flex-1 relative">
+          {/* OnlyOffice 닫기 버튼 */}
+          {onClose && (
+            <button
+              className="absolute top-3 right-3 z-[100] bg-dark-deeper/90 border border-dark-border text-txt-secondary py-1.5 px-3 rounded text-[12px] cursor-pointer hover:bg-red-900/50 hover:text-red-400 hover:border-red-400/30 transition-all duration-200 backdrop-blur-sm shadow-lg"
+              onClick={onClose}
+            >
+              ✕ 닫기
+            </button>
+          )}
+          <div id="onlyoffice-editor" className="w-full h-full" />
+        </div>
       ) : (
         <div className="flex-1 overflow-y-auto p-0 bg-[#c8c8c8] flex flex-col items-center gap-[30px]">
           {isEditing ? (

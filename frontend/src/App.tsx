@@ -67,14 +67,48 @@ function App() {
     checkBackendStatus()
   }, [])
 
-  const handleDocumentSelect = async (docId: string, content?: string) => {
+  const handleDocumentSelect = async (docId: string, docType?: string) => {
+    setSelectedDocument(docId)
+    setIsEditing(false)
+    setIsOnlyOfficeMode(false)
+    setOnlyOfficeConfig(null)
+    setDocumentContent(null)
+
+    // PDF → 텍스트 content 불러와서 기존 renderDocument()로 표시
+    if (docType?.toLowerCase() === 'pdf') {
+      try {
+        const response = await fetch(`${API_URL}/rag/document/${docId}/content`)
+        if (response.ok) {
+          const data = await response.json()
+          setDocumentContent(data.content || '')
+          setEditedContent(data.content || '')
+        }
+      } catch (error) {
+        console.error('PDF content 로드 오류:', error)
+      }
+      return
+    }
+
+    // DOCX → OnlyOffice
+    if (docType?.toLowerCase() !== 'docx') {
+      // docx가 아닌 기타 파일 → 텍스트 컨텐트로 표시
+      try {
+        const response = await fetch(`${API_URL}/rag/document/${docId}/content`)
+        if (response.ok) {
+          const data = await response.json()
+          setDocumentContent(data.content || '')
+          setEditedContent(data.content || '')
+        }
+      } catch (error) {
+        console.error('문서 content 로드 오류:', error)
+      }
+      return
+    }
+
     try {
-      setSelectedDocument(docId)
       setIsOnlyOfficeMode(true)
       setOnlyOfficeEditorMode('view')
-      setIsEditing(false)
 
-      // OnlyOffice 보기 모드 설정 가져오기
       const response = await fetch(`${API_URL}/onlyoffice/config`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -92,21 +126,19 @@ function App() {
       } else {
         console.error('OnlyOffice 설정 가져오기 실패')
         setIsOnlyOfficeMode(false)
-        // 폴백: 텍스트 콘텐츠 로드
-        if (content) {
-          setDocumentContent(content)
-          setEditedContent(content)
-        }
       }
     } catch (error) {
       console.error('OnlyOffice 초기화 오류:', error)
       setIsOnlyOfficeMode(false)
-      // 폴백: 텍스트 콘텐츠 로드
-      if (content) {
-        setDocumentContent(content)
-        setEditedContent(content)
-      }
     }
+  }
+
+  const handleCloseViewer = () => {
+    setSelectedDocument(null)
+    setDocumentContent(null)
+    setIsOnlyOfficeMode(false)
+    setOnlyOfficeConfig(null)
+    setIsEditing(false)
   }
 
   const handleSaveDocument = async () => {
@@ -358,6 +390,7 @@ function App() {
               onlyOfficeEditorMode={onlyOfficeEditorMode}
               onlyOfficeConfig={onlyOfficeConfig}
               onlyOfficeServerUrl={onlyOfficeServerUrl}
+              onClose={handleCloseViewer}
             />
           ) : (
             <div className="flex-1 flex flex-col items-center justify-center text-txt-secondary">

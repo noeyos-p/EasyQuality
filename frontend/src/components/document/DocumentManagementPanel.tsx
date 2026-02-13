@@ -27,7 +27,7 @@ interface Version {
 }
 
 interface DocumentManagementPanelProps {
-  onDocumentSelect?: (docId: string, content?: string) => void;
+  onDocumentSelect?: (docId: string, docType?: string) => void;
   onNotify?: (message: string, type?: 'success' | 'error' | 'info') => void;
   onOpenInEditor?: (docId: string, version?: string) => void;
 }
@@ -97,9 +97,19 @@ export default function DocumentManagementPanel({ onDocumentSelect, onNotify, on
     });
   };
 
+  // docId로 doc_type 조회
+  const getDocType = (docId: string): string | undefined => {
+    for (const group of groupedDocuments.values()) {
+      const doc = group.documents.find(d => d.doc_id === docId);
+      if (doc) return doc.doc_type;
+    }
+    return undefined;
+  };
+
   // 문서 클릭 시 최신 버전 내용 바로 표시
   const handleDocumentSelect = async (docName: string) => {
     setSelectedDoc(docName);
+    const docType = getDocType(docName);
 
     try {
       const versionResponse = await fetch(`${API_URL}/rag/document/${docName}/versions`);
@@ -107,30 +117,26 @@ export default function DocumentManagementPanel({ onDocumentSelect, onNotify, on
       const fetchedVersions: Version[] = versionData.versions || [];
       setVersions(fetchedVersions);
 
-      // 최신 버전(첫 번째) 내용 자동 표시
       const latestVersion = fetchedVersions[0]?.version;
-      await handleViewDocument(docName, latestVersion);
+      await handleViewDocument(docName, latestVersion, docType);
     } catch (error) {
       console.error('문서 로드 실패:', error);
       setVersions([]);
-      await handleViewDocument(docName);
+      await handleViewDocument(docName, undefined, docType);
     }
   };
 
   // 문서 내용 보기
-  const handleViewDocument = async (docName: string, version?: string) => {
+  const handleViewDocument = async (docName: string, version?: string, docType?: string) => {
+    // 항상 onDocumentSelect 호출 (content 조회 실패해도 뷰어는 열림)
+    if (onDocumentSelect) {
+      onDocumentSelect(docName, docType);
+    }
     try {
       const url = version
         ? `${API_URL}/rag/document/${docName}/content?version=${version}`
         : `${API_URL}/rag/document/${docName}/content`;
-
-      const response = await fetch(url);
-      await response.json();
-
-      // App.tsx의 뷰어에 표시
-      if (onDocumentSelect) {
-        onDocumentSelect(docName);
-      }
+      await fetch(url);
     } catch (error) {
       console.error('문서 내용 조회 실패:', error);
     }
@@ -350,7 +356,7 @@ export default function DocumentManagementPanel({ onDocumentSelect, onNotify, on
                 {/* btn-icon */}
                 <button
                   className="bg-transparent border-none text-txt-primary cursor-pointer p-1 rounded-[3px] flex items-center justify-center transition-all duration-200 hover:bg-dark-border hover:text-txt-white"
-                  onClick={() => handleViewDocument(selectedDoc, ver.version)}
+                  onClick={() => handleViewDocument(selectedDoc, ver.version, getDocType(selectedDoc))}
                   title="이 버전 보기"
                 >
                   보기

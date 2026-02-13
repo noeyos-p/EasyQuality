@@ -31,6 +31,39 @@ class S3Store:
     def _key(self, doc_id: str, version: str) -> str:
         return f"documents/{doc_id}/v{version}/document.docx"
 
+    def _pdf_key(self, doc_id: str, version: str) -> str:
+        return f"documents/{doc_id}/v{version}/document.pdf"
+
+    def upload_pdf(self, doc_id: str, version: str, content: bytes) -> str:
+        """원본 PDF를 S3에 저장"""
+        key = self._pdf_key(doc_id, version)
+        self.s3.put_object(
+            Bucket=self.bucket,
+            Key=key,
+            Body=content,
+            ContentType='application/pdf',
+        )
+        return key
+
+    def get_pdf_presigned_url(self, doc_id: str, version: str, expires: int = 3600) -> str:
+        """S3 PDF 파일의 임시 접근 URL 반환"""
+        key = self._pdf_key(doc_id, version)
+        url = self.s3.generate_presigned_url(
+            'get_object',
+            Params={'Bucket': self.bucket, 'Key': key},
+            ExpiresIn=expires,
+        )
+        return url
+
+    def pdf_exists(self, doc_id: str, version: str) -> bool:
+        """S3에 PDF 파일이 존재하는지 확인"""
+        key = self._pdf_key(doc_id, version)
+        try:
+            self.s3.head_object(Bucket=self.bucket, Key=key)
+            return True
+        except ClientError:
+            return False
+
     def get_presigned_url(self, doc_id: str, version: str, expires: int = 3600) -> str:
         """S3 파일의 임시 접근 URL 반환"""
         key = self._key(doc_id, version)

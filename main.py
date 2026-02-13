@@ -70,6 +70,7 @@ class SearchRequest(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     session_id: Optional[str] = None
+    user_id: Optional[int] = None
     collection: str = "documents"
     n_results: int = DEFAULT_N_RESULTS
     embedding_model: str = "multilingual-e5-small"
@@ -737,6 +738,14 @@ async def upload_document(
                 version=final_version
             )
 
+            # 원본 PDF를 S3에 저장
+            if filename.lower().endswith('.pdf'):
+                try:
+                    s3_store.upload_pdf(doc_id, final_version, content)
+                    print(f"  🟢 원본 PDF S3 저장 완료: {doc_id}/v{final_version}")
+                except Exception as e:
+                    print(f"  🟡 S3 PDF 저장 실패 (무시): {e}")
+
             if doc_id_db and chunks:
                 batch_chunks = [
                     {
@@ -836,36 +845,36 @@ async def chat(request: ChatRequest):
     - Manual RAG 로직 제거됨
     - 오직 Agent Orchestrator를 통해서만 답변
     """
+    import asyncio
     print(f" [Agent] 요청 수신: {request.message}")
-    
+
     try:
-        from backend.agent import run_agent, init_agent_tools
+        # Agent 초기화
         init_agent_tools(vector_store, get_graph_store(), sql_store)
-        
-        # 사용자 ID 추출
-        user_id = getattr(request, 'user_id', None)
-        
+
         # 🧠 롱텀 메모리: 이전 대화 기록 및 유사 기억 조회
         chat_history = []
+        user_id = request.user_id
         if user_id:
             try:
+                # 1. 최근 대화 (History)
                 chat_history = sql_store.get_conversation_history(user_id, limit=6)
-                
+
+                # 2. 관련 기억 (Semantic Memory)
                 query_embedding = embed_text(request.message)
                 semantic_memories = sql_store.search_memory_similar(user_id, query_embedding, limit=3)
-                
+
                 if semantic_memories:
                     memory_block = "\n".join([f"- Q: {m['question']}\n  A: {m['answer']}" for m in semantic_memories])
                     print(f"  🧠 [Memory] 관련 기억 {len(semantic_memories)}건 발견")
                     chat_history = [{"role": "system", "content": f"[관련 과거 기억]\n{memory_block}"}] + chat_history
-                    
                 print(f"  🧠 [Memory] 사용자 {user_id}의 컨텍스트 로드 완료")
             except Exception as e:
                 print(f"  ⚠️ [Memory] 조회 실패: {e}")
                 import traceback
                 traceback.print_exc()
 
-        # Agent 실행 (이벤트 루프 차단 방지를 위해 별도 스레드)
+        # Agent 실행 (이벤트 루프 차단을 방지하기 위해 별도 스레드에서 실행)
         response = await asyncio.to_thread(
             run_agent,
             query=request.message,
@@ -904,6 +913,38 @@ async def chat(request: ChatRequest):
                 import traceback
                 traceback.print_exc()
 
+        # 🧠 롱텀 메모리: 새로운 대화 저장 (임베딩 + 요약)
+        if user_id and answer:
+            try:
+                if 'query_embedding' not in locals():
+                    query_embedding = embed_text(request.message)
+
+                summarized_answer = answer
+                if len(answer) > 200:
+                    summary_prompt = f"다음 Q&A를 나중을 위해 핵심만 1~2줄로 요약해줘.\nQ: {request.message}\nA: {answer}\n\n요약 (존댓말):"
+                    try:
+                        summarized = get_llm_response(
+                            prompt=summary_prompt,
+                            llm_model="gpt-4o-mini",
+                            llm_backend="openai",
+                            max_tokens=150,
+                            temperature=0.3
+                        )
+                        summarized_answer = summarized.replace("요약:", "").strip()
+                    except Exception:
+                        summarized_answer = answer[:500]
+
+                sql_store.save_memory(
+                    request.message, summarized_answer, user_id,
+                    embedding=query_embedding,
+                    session_id=request.session_id or "default"
+                )
+                print(f"  💾 [Memory] 대화 요약 저장 완료 (길이: {len(summarized_answer)})")
+            except Exception as e:
+                print(f"  ⚠️ [Memory] 저장 실패: {e}")
+                import traceback
+                traceback.print_exc()
+
         # LLM as a Judge 평가
         evaluation_scores = None
         error_patterns = ["오류가 발생", "에러", "실패", "Error", "Exception", "찾을 수 없", "준비하지 못", "로딩 에러"]
@@ -923,7 +964,6 @@ async def chat(request: ChatRequest):
                     context=context,
                     metrics=["faithfulness", "groundness", "relevancy", "correctness"]
                 )
-                
                 # 로그 출력
                 if evaluation_scores:
                     print(f"\n{'='*60}")
@@ -959,7 +999,6 @@ async def chat(request: ChatRequest):
         import traceback
         traceback.print_exc()
         raise HTTPException(500, str(e))
-
 
 
 @app.get("/chat/history/{session_id}")
@@ -1061,6 +1100,34 @@ def list_doc_names():
     except Exception as e:
         print(f"문서 이름 목록 조회 실패: {e}")
         return {"doc_names": []}
+
+
+@app.get("/rag/document/{doc_name}/pdf-url")
+def get_pdf_presigned_url(doc_name: str, version: Optional[str] = None):
+    """PDF 열람 URL 반환 - S3 presigned URL 우선, 없으면 download 엔드포인트 사용"""
+    try:
+        # 버전이 없으면 최신 버전 사용
+        if not version:
+            versions = sql_store.get_document_versions(doc_name)
+            if not versions:
+                raise HTTPException(404, f"문서를 찾을 수 없습니다: {doc_name}")
+            version = versions[0]['version']
+
+        # S3에서 원본 PDF 시도
+        try:
+            store = get_s3_store()
+            if store.pdf_exists(doc_name, version):
+                url = store.get_pdf_presigned_url(doc_name, version)
+                return {"url": url, "source": "s3", "doc_name": doc_name, "version": version}
+        except Exception as s3_err:
+            print(f"  S3 PDF 조회 실패 (download로 폴백): {s3_err}")
+
+        # 폴백: 백엔드 download 엔드포인트 사용 (프론트에서 auth 헤더 필요)
+        return {"url": None, "source": "download", "doc_name": doc_name, "version": version}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"PDF URL 조회 실패: {str(e)}")
 
 
 @app.get("/rag/document/{doc_name}/versions")
