@@ -22,6 +22,7 @@ import torch
 import time
 import re
 import uuid
+import asyncio
 import json
 import os
 from io import BytesIO
@@ -829,7 +830,7 @@ def _upload_to_neo4j_from_pipeline(graph, result: dict, filename: str):
 # ═══════════════════════════════════════════════════════════════════════════
 
 @app.post("/chat")
-def chat(request: ChatRequest):
+async def chat(request: ChatRequest):
     """
     Main Agent Chat Endpoint
     - Manual RAG 로직 제거됨
@@ -838,146 +839,108 @@ def chat(request: ChatRequest):
     print(f" [Agent] 요청 수신: {request.message}")
     
     try:
-        # Agent 실행
-        # llm.py 업데이트에 따라 model_name 파라미터 등을 적절히 전달
+        from backend.agent import run_agent, init_agent_tools
         init_agent_tools(vector_store, get_graph_store(), sql_store)
         
-        response = run_agent(
+        # 사용자 ID 추출
+        user_id = getattr(request, 'user_id', None)
+        
+        # 🧠 롱텀 메모리: 이전 대화 기록 및 유사 기억 조회
+        chat_history = []
+        if user_id:
+            try:
+                chat_history = sql_store.get_conversation_history(user_id, limit=6)
+                
+                query_embedding = embed_text(request.message)
+                semantic_memories = sql_store.search_memory_similar(user_id, query_embedding, limit=3)
+                
+                if semantic_memories:
+                    memory_block = "\n".join([f"- Q: {m['question']}\n  A: {m['answer']}" for m in semantic_memories])
+                    print(f"  🧠 [Memory] 관련 기억 {len(semantic_memories)}건 발견")
+                    chat_history = [{"role": "system", "content": f"[관련 과거 기억]\n{memory_block}"}] + chat_history
+                    
+                print(f"  🧠 [Memory] 사용자 {user_id}의 컨텍스트 로드 완료")
+            except Exception as e:
+                print(f"  ⚠️ [Memory] 조회 실패: {e}")
+                import traceback
+                traceback.print_exc()
+
+        # Agent 실행 (이벤트 루프 차단 방지를 위해 별도 스레드)
+        response = await asyncio.to_thread(
+            run_agent,
             query=request.message,
             session_id=request.session_id or str(uuid.uuid4()),
-            model_name=request.llm_model or "gpt-4o-mini"
+            model_name=request.llm_model or "gpt-4o-mini",
+            chat_history=chat_history
         )
-
+        
         answer = response.get("answer")
+        
+        # 🧠 롱텀 메모리: 새로운 대화 저장 (임베딩 + 요약)
+        if user_id and answer:
+            try:
+                if 'query_embedding' not in locals():
+                    query_embedding = embed_text(request.message)
+                
+                summarized_answer = answer
+                if len(answer) > 200:
+                    summary_prompt = f"다음 Q&A를 나중을 위해 핵심만 1~2줄로 요약해줘.\nQ: {request.message}\nA: {answer}\n\n요약 (존댓말):"
+                    try:
+                        summarized = get_llm_response(
+                            prompt=summary_prompt,
+                            llm_model="gpt-4o-mini",
+                            llm_backend="openai",
+                            max_tokens=150,
+                            temperature=0.3
+                        )
+                        summarized_answer = summarized.replace("요약:", "").strip()
+                    except:
+                        summarized_answer = answer[:500]
+
+                sql_store.save_memory(request.message, summarized_answer, user_id, embedding=query_embedding, session_id=request.session_id or "default")
+                print(f"  💾 [Memory] 대화 요약 저장 완료 (길이: {len(summarized_answer)})")
+            except Exception as e:
+                print(f"  ⚠️ [Memory] 저장 실패: {e}")
+                import traceback
+                traceback.print_exc()
 
         # LLM as a Judge 평가
         evaluation_scores = None
-
-        # 에러 메시지 패턴 감지
         error_patterns = ["오류가 발생", "에러", "실패", "Error", "Exception", "찾을 수 없", "준비하지 못", "로딩 에러"]
         is_error_message = any(pattern in answer for pattern in error_patterns)
-
+        
         try:
             from backend.evaluation import AgentEvaluator
-
-<<<<<<< Updated upstream
-            # 평가 생략 조건
-            if len(answer) < 20:
-                print("평가 생략: 답변이 너무 짧음")
-            elif is_error_message:
-                print("평가 생략: 에러 메시지")
-            else:
-                # 평가 실행 (RDB 검증 필수!)
-                evaluator = AgentEvaluator(
-                    judge_model="gpt-4o-mini",
-                    sql_store=sql_store  # ✅ RDB 검증을 위해 필수 전달
-                )
-
-                # context 추출 (agent_log에서)
+            if len(answer) >= 20 and not is_error_message:
+                evaluator = AgentEvaluator(judge_model="gpt-4o-mini", sql_store=sql_store)
                 context = response.get("agent_log", {}).get("context", "")
                 if isinstance(context, list):
                     context = "\n\n".join(context)
-
+                
                 evaluation_scores = evaluator.evaluate_single(
                     question=request.message,
                     answer=answer,
                     context=context,
                     metrics=["faithfulness", "groundness", "relevancy", "correctness"]
                 )
-=======
-            # Agent 실행 (이벤트 루프 차단을 방지하기 위해 별도 스레드에서 실행)
-            from backend.agent import run_agent, init_agent_tools
-            init_agent_tools(vector_store, get_graph_store(), sql_store)
-            
-            # 🧠 롱텀 메모리: 이전 대화 기록 및 유사 기억 조회
-            chat_history = []
-            if user_id:
-                try:
-                    # 1. 최근 대화 (History)
-                    chat_history = sql_store.get_conversation_history(user_id, limit=6)
-                    
-                    # 2. 관련 기억 (Semantic Memory)
-                    # 질문 임베딩 생성 (e5-small)
-                    query_embedding = embed_text(request.message)
-                    semantic_memories = sql_store.search_memory_similar(user_id, query_embedding, limit=3)
-                    
-                    if semantic_memories:
-                        memory_block = "\n".join([f"- Q: {m['question']}\n  A: {m['answer']}" for m in semantic_memories])
-                        print(f"  🧠 [Memory] 관련 기억 {len(semantic_memories)}건 발견")
-                        # 시스템 메시지로 주입 (가장 앞에 배치)
-                        chat_history = [{"role": "system", "content": f"[관련 과거 기억]\n{memory_block}"}] + chat_history
-                        
-                    print(f"  🧠 [Memory] 사용자 {user_id}의 컨텍스트 로드 완료")
-                except Exception as e:
-                    print(f"  ⚠️ [Memory] 조회 실패: {e}")
-                    import traceback
-                    traceback.print_exc()
-
-            response = await asyncio.to_thread(
-                run_agent,
-                query=request.message,
-                session_id=request.session_id or str(uuid.uuid4()),
-                model_name=request.llm_model or "gpt-4o-mini",
-                chat_history=chat_history  # 히스토리 전달 (유사 기억 포함)
-            )
-            
-            answer = response.get("answer")
-            
-            # 🧠 롱텀 메모리: 새로운 대화 저장 (임베딩 + 요약)
-            if user_id and answer:
-                try:
-                     # 1. 질문 임베딩 생성 (재사용)
-                    if 'query_embedding' not in locals():
-                        query_embedding = embed_text(request.message)
-                    
-                    summarized_answer = answer
-                    # 2. 기억 요약 (토큰 절약 및 품질 향상) - 선택적
-                    if len(answer) > 200:
-                        summary_prompt = f"다음 Q&A를 나중을 위해 핵심만 1~2줄로 요약해줘.\nQ: {request.message}\nA: {answer}\n\n요약 (존댓말):"
-                        try:
-                            summarized = get_llm_response(
-                                prompt=summary_prompt,
-                                llm_model="gpt-4o-mini",
-                                llm_backend="openai",
-                                max_tokens=150,
-                                temperature=0.3
-                            )
-                            # "요약:" 같은 접두어 제거
-                            summarized_answer = summarized.replace("요약:", "").strip()
-                        except:
-                            summarized_answer = answer[:500] # 실패 시 원본 사용
-
-                    # 3. 저장
-                    sql_store.save_memory(request.message, summarized_answer, user_id, embedding=query_embedding, session_id=request.session_id or "default")
-                    print(f"  💾 [Memory] 대화 요약 저장 완료 (길이: {len(summarized_answer)})")
-                except Exception as e:
-                    print(f"  ⚠️ [Memory] 저장 실패: {e}")
-                    import traceback
-                    traceback.print_exc()
->>>>>>> Stashed changes
-
+                
                 # 로그 출력
                 if evaluation_scores:
                     print(f"\n{'='*60}")
                     print(f"평가 결과 (평균: {evaluation_scores.get('average_score', 0)}/5)")
                     print(f"{'='*60}")
                     for metric, result in evaluation_scores.items():
-                        # average_score는 건너뜀 (float이므로 .get() 메서드 없음)
                         if metric == "average_score":
                             continue
-
                         score = result.get("score", 0)
                         reasoning = result.get("reasoning", "")
                         print(f"\n[{metric.upper()}]")
                         print(f"  점수: {score}/5")
                         print(f"  이유: {reasoning}")
-
-                        # RDB 검증 결과 출력
                         if "rdb_verification" in result:
                             rdb = result["rdb_verification"]
                             print(f"  📊 RDB 검증: 정확도 {rdb.get('accuracy_rate', 0)}% ({rdb.get('verified_citations', 0)}/{rdb.get('total_citations', 0)})")
                     print(f"{'='*60}\n")
-
         except ImportError:
             print("평가 모듈 사용 불가 (선택적 기능)")
         except Exception as eval_error:

@@ -533,11 +533,6 @@ class SQLStore:
             return None
 
     # Memory 테이블 관련 메서드
-<<<<<<< Updated upstream
-    def save_memory(self, question: str, answer: str, users_id: int = None) -> Optional[int]:
-        """대화 기록 저장"""
-        insert_query = "INSERT INTO memory (question, answer, users_id) VALUES (%s, %s, %s) RETURNING id;"
-=======
     def save_memory(self, question: str, answer: str, users_id: int = None, embedding: List[float] = None, session_id: str = "default") -> Optional[int]:
         """대화 기록 저장"""
         if embedding:
@@ -547,11 +542,10 @@ class SQLStore:
             insert_query = "INSERT INTO memory (question, answer, users_id, session_id) VALUES (%s, %s, %s, %s) RETURNING id;"
             params = (question, answer, users_id, session_id)
             
->>>>>>> Stashed changes
         try:
             with self._get_connection() as conn:
                 with conn.cursor() as cur:
-                    cur.execute(insert_query, (question, answer, users_id))
+                    cur.execute(insert_query, params)
                     memory_id = cur.fetchone()[0]
                     conn.commit()
             return memory_id
@@ -576,8 +570,6 @@ class SQLStore:
         except Exception:
             return []
 
-<<<<<<< Updated upstream
-=======
     def get_conversation_history(self, user_id: int, limit: int = 10) -> List[Dict]:
         """대화 기록 조회 (Agent용 포맷)"""
         memories = self.get_memory_by_user(user_id, limit)
@@ -609,7 +601,6 @@ class SQLStore:
             print(f" [SQLStore] 유사 기억 검색 실패: {e}")
             return []
 
->>>>>>> Stashed changes
     # ═══════════════════════════════════════════════════════════════════════════
     # 마이그레이션 함수
     # ═══════════════════════════════════════════════════════════════════════════
