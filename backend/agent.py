@@ -67,7 +67,7 @@ def safe_json_loads(text: str) -> dict:
         # 정규식으로 핵심 필드 추출 시도 (최후의 수단)
         res = {}
         for key in ["doc_id", "target_clause", "intent", "next_action", "plan", "mode"]:
-            match = re.search(rf'"{key}"\s*:\s*"([^"]+)"', text)
+            match = re.search(f'"{key}"\\s*:\\s*"([^"]+)"', text)
             if match: res[key] = match.group(1)
         return res
 
@@ -501,20 +501,14 @@ def create_workflow():
 
 _app = None
 
-def run_agent(query: str, session_id: str = "default", model_name: str = None, embedding_model: str = None, chat_history: List[Dict] = None, **kwargs):
+def run_agent(query: str, session_id: str = "default", model_name: str = None, embedding_model: str = None, **kwargs):
     global _app
     if not _app:
         _app = create_workflow()
 
-    # 채팅 히스토리 반영
-    messages = []
-    if chat_history:
-        messages.extend(chat_history)
-    messages.append({"role": "user", "content": query})
-
     initial_state = {
         "query": query,
-        "messages": messages,
+        "messages": [{"role": "user", "content": query}],
         "next_agent": "orchestrator",
         "worker_model": model_name or "gpt-4o-mini",
         "orchestrator_model": "gpt-4o-mini",

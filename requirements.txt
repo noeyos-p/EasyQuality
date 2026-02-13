@@ -7,10 +7,6 @@ fastapi
 uvicorn
 python-multipart
 
-# === 인증 & 보안 (Auth) ===
-passlib[bcrypt]
-python-jose[cryptography]
-
 # === 데이터베이스 ===
 psycopg2-binary
 neo4j
@@ -49,3 +45,15 @@ numpy
 python-dotenv
 
 weaviate-client
+
+# === 인증/보안 ===
+passlib[bcrypt]
+python-jose[cryptography]
+python-multipart
+
+# === AWS S3 ===
+boto3
+
+# === OnlyOffice ===
+PyJWT
+httpx

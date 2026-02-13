@@ -1,17 +1,18 @@
 import { useState, useEffect } from 'react';
 import docLargeIcon from '../../assets/icons/document-manage.svg'; // Vector 21 - SOP, WI
 import docSmallIcon from '../../assets/icons/document.svg';        // Vector 20 - FRM, 기타
-
-const API_URL = 'http://localhost:8000';
+import { API_URL } from '../../types';
 
 interface Document {
   doc_id: string;
   doc_name?: string;
   doc_title?: string;
   doc_category?: string;
+  doc_type?: string;
   chunk_count?: number;
   model?: string;
   collection?: string;
+  version?: string;
 }
 
 interface DocumentGroup {
@@ -27,10 +28,11 @@ interface Version {
 
 interface DocumentManagementPanelProps {
   onDocumentSelect?: (docId: string, content?: string) => void;
-  onNotify?: (message: string, type?: 'success' | 'error' | 'info') => void; // 🆕 알림 트리거용 프롭스
+  onNotify?: (message: string, type?: 'success' | 'error' | 'info') => void;
+  onOpenInEditor?: (docId: string, version?: string) => void;
 }
 
-export default function DocumentManagementPanel({ onDocumentSelect, onNotify }: DocumentManagementPanelProps) {
+export default function DocumentManagementPanel({ onDocumentSelect, onNotify, onOpenInEditor }: DocumentManagementPanelProps) {
   const [groupedDocuments, setGroupedDocuments] = useState<Map<string, DocumentGroup>>(new Map());
   const [selectedDoc, setSelectedDoc] = useState<string | null>(null);
   const [versions, setVersions] = useState<Version[]>([]);
@@ -39,25 +41,10 @@ export default function DocumentManagementPanel({ onDocumentSelect, onNotify }: 
   const [isUploading, setIsUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<string>('');
   const [isDeleting, setIsDeleting] = useState(false);
+  const [docxDocName, setDocxDocName] = useState<string>('');
+  const [docxVersion, setDocxVersion] = useState<string>('1.0');
 
-  // 🆕 배경 처리 상태 관리
-  const [isProcessing, setIsProcessing] = useState(false);
-  const [processingFileName, setProcessingFileName] = useState<string>('');
-
-  // 🆕 외부(App.tsx)에서 발생한 저장 이벤트를 감지하여 로딩바 시작
-  useEffect(() => {
-    const handleSaveStart = (e: any) => {
-      const { docName } = e.detail;
-      setIsProcessing(true);
-      setProcessingFileName(`저장 중: ${docName}`);
-
-      // 저장 완료 감지를 위한 폴링 (버전이 올라가거나 일정 시간 후 목록 갱신)
-      startPollingForSave(docName);
-    };
-
-    window.addEventListener('document_processing_start', handleSaveStart);
-    return () => window.removeEventListener('document_processing_start', handleSaveStart);
-  }, []);
+  const isDocxFile = uploadFile?.name.toLowerCase().endsWith('.docx') ?? false;
 
   // 문서 목록 로드
   useEffect(() => {
@@ -94,66 +81,9 @@ export default function DocumentManagementPanel({ onDocumentSelect, onNotify }: 
       );
 
       setGroupedDocuments(sortedGroups);
-      return docs.length; // 문서 개수 반환
     } catch (error) {
       console.error('문서 목록 조회 실패:', error);
-      return 0;
     }
-  };
-
-  // 비동기 업로드 완료 감지를 위한 폴링 로직
-  const startPolling = (initialCount: number) => {
-    let attempts = 0;
-    const maxAttempts = 15; // 3초 * 15 = 45초
-
-    console.log(`🚀 [Polling] 자동 갱신 시작 (현재 문서 수: ${initialCount})`);
-
-    const intervalId = setInterval(async () => {
-      attempts++;
-      const currentCount = await fetchDocuments();
-
-      console.log(`🔄 [Polling] 시도 ${attempts}/${maxAttempts} (문서 수: ${currentCount})`);
-
-      if (currentCount > initialCount || attempts >= maxAttempts) {
-        clearInterval(intervalId);
-        setIsProcessing(false);
-        setProcessingFileName('');
-        if (currentCount > initialCount && onNotify) {
-          onNotify("문서 업로드 및 분석이 완료되었습니다. 🎉", "success");
-        }
-      }
-    }, 3000);
-  };
-
-  // 🆕 저장 완료 감지를 위한 폴링 로직 (버전 비교)
-  const startPollingForSave = (docName: string) => {
-    let attempts = 0;
-    const maxAttempts = 15;
-
-    const intervalId = setInterval(async () => {
-      attempts++;
-
-      // 버전 목록 조회
-      try {
-        const res = await fetch(`${API_URL}/rag/document/${docName}/versions`);
-        await res.json();
-        // 단순히 시간 기반 또는 성공 응답 여부로 처리해도 되지만, 여기서는 fetchDocuments로 전체 갱신 유도
-        await fetchDocuments();
-
-        if (attempts >= maxAttempts) {
-          clearInterval(intervalId);
-          setIsProcessing(false);
-          setProcessingFileName('');
-        } else if (attempts === 4) { // 대략 12초 후 "완료" 알림 (분석 속도 감안)
-          if (onNotify) onNotify(`'${docName}' 저장 및 분석이 완료되었습니다. ✅`, "success");
-          setIsProcessing(false);
-          setProcessingFileName('');
-          clearInterval(intervalId);
-        }
-      } catch {
-        if (attempts >= maxAttempts) clearInterval(intervalId);
-      }
-    }, 3000);
   };
 
   const toggleGroup = (category: string) => {
@@ -242,49 +172,59 @@ export default function DocumentManagementPanel({ onDocumentSelect, onNotify }: 
       alert('파일을 선택해주세요.');
       return;
     }
+    if (isDocxFile && !docxDocName.trim()) {
+      alert('문서 ID를 입력해주세요. (예: EQ-SOP-00001)');
+      return;
+    }
 
     setIsUploading(true);
     setUploadProgress('업로드 중...');
 
     const formData = new FormData();
     formData.append('file', uploadFile);
-    formData.append('collection', 'documents');
-    formData.append('use_langgraph', 'true');
 
     try {
-      const response = await fetch(`${API_URL}/rag/upload`, {
-        method: 'POST',
-        body: formData,
-      });
+      let response: Response;
+
+      if (isDocxFile) {
+        // DOCX → S3 저장 + 파이프라인
+        formData.append('doc_name', docxDocName.trim());
+        formData.append('version', docxVersion.trim() || '1.0');
+        formData.append('collection', 'documents');
+        response = await fetch(`${API_URL}/rag/upload-docx`, {
+          method: 'POST',
+          body: formData,
+        });
+      } else {
+        // PDF → 기존 파이프라인
+        formData.append('collection', 'documents');
+        formData.append('use_langgraph', 'true');
+        response = await fetch(`${API_URL}/rag/upload`, {
+          method: 'POST',
+          body: formData,
+        });
+      }
 
       if (response.ok) {
-        await response.json();
-        setUploadProgress('🟢 업로드 완료! (서버 처리 중...)');
-
-        // 현재 문서 수 확인
-        const currentCount = Array.from(groupedDocuments.values()).reduce(
-          (acc, group) => acc + group.documents.length,
-          0
-        );
-
+        setUploadProgress('업로드 완료!');
+        if (onNotify) {
+          onNotify('문서 업로드가 완료되었습니다.', 'success');
+        }
         setTimeout(() => {
           setIsUploadModalOpen(false);
           setUploadFile(null);
+          setDocxDocName('');
+          setDocxVersion('1.0');
           setUploadProgress('');
-
-          // 🆕 배경 처리 상태 시작
-          setIsProcessing(true);
-          setProcessingFileName(uploadFile.name);
-
-          // 🆕 비동기 처리가 완료되어 리스트에 나타날 때까지 폴링 시작
-          startPolling(currentCount);
+          fetchDocuments();
         }, 1500);
       } else {
-        setUploadProgress('🔴 업로드 실패');
+        const err = await response.json();
+        setUploadProgress(`업로드 실패: ${err.detail || '알 수 없는 오류'}`);
       }
     } catch (error) {
       console.error('업로드 실패:', error);
-      setUploadProgress('🔴 업로드 중 오류 발생');
+      setUploadProgress('업로드 중 오류 발생');
     } finally {
       setIsUploading(false);
     }
@@ -376,6 +316,15 @@ export default function DocumentManagementPanel({ onDocumentSelect, onNotify }: 
                             <span className="text-txt-secondary text-[11px] ml-1">({doc.chunk_count}개)</span>
                           )}
                         </div>
+                        {doc.doc_type === 'docx' && onOpenInEditor && (
+                          <button
+                            className="ml-1 bg-transparent border border-dark-border text-[#4ec9b0] text-[10px] py-0.5 px-1.5 rounded cursor-pointer transition-all duration-200 hover:bg-dark-border hover:text-white flex-shrink-0"
+                            onClick={(e) => { e.stopPropagation(); onOpenInEditor(doc.doc_id, doc.version) }}
+                            title="OnlyOffice 에디터에서 열기"
+                          >
+                            편집
+                          </button>
+                        )}
                       </div>
                     ))}
                   </div>
@@ -427,11 +376,33 @@ export default function DocumentManagementPanel({ onDocumentSelect, onNotify }: 
 
             <input
               type="file"
-              accept=".pdf"
+              accept=".pdf,.docx"
               className="w-full mb-4 text-txt-primary"
               onChange={(e) => setUploadFile(e.target.files?.[0] || null)}
               disabled={isUploading}
             />
+
+            {/* DOCX 파일일 때 추가 입력 필드 */}
+            {isDocxFile && (
+              <>
+                <input
+                  type="text"
+                  placeholder="문서 ID (예: EQ-SOP-00001)"
+                  className="w-full mb-2 px-3 py-2 bg-dark-bg border border-dark-border rounded text-txt-primary text-[13px]"
+                  value={docxDocName}
+                  onChange={(e) => setDocxDocName(e.target.value)}
+                  disabled={isUploading}
+                />
+                <input
+                  type="text"
+                  placeholder="버전 (예: 1.0)"
+                  className="w-full mb-4 px-3 py-2 bg-dark-bg border border-dark-border rounded text-txt-primary text-[13px]"
+                  value={docxVersion}
+                  onChange={(e) => setDocxVersion(e.target.value)}
+                  disabled={isUploading}
+                />
+              </>
+            )}
 
             {/* upload-progress */}
             {uploadProgress && (
@@ -456,25 +427,6 @@ export default function DocumentManagementPanel({ onDocumentSelect, onNotify }: 
               </button>
             </div>
           </div>
-        </div>
-      )}
-
-      {/* 🆕 배경 작업 상태 표시 바 (Tailwind 전용 토큰 사용) */}
-      {isProcessing && (
-        <div className="fixed bottom-6 right-6 flex items-center gap-3 bg-dark-light border border-dark-border px-4 py-3 rounded-lg shadow-2xl z-[2000] animate-pulse">
-          {/* 스피너 아이콘 */}
-          <div className="w-4 h-4 border-2 border-accent-blue border-t-transparent rounded-full animate-spin" />
-          <div className="flex flex-col">
-            <span className="text-[13px] text-txt-primary font-medium line-height-[1.2]">문서 처리 중...</span>
-            <span className="text-[11px] text-txt-secondary truncate max-w-[200px]">{processingFileName}</span>
-          </div>
-          {/* 닫기 버튼 (옵션: 폴링은 계속됨) */}
-          <button
-            className="ml-2 text-txt-muted hover:text-txt-primary text-[14px]"
-            onClick={() => setIsProcessing(false)}
-          >
-            ×
-          </button>
         </div>
       )}
     </div>

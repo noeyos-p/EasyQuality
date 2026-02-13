@@ -1,0 +1,13 @@
+.env
+.env.*
+.git/
+.gitignore
+frontend/
+tests/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+*.log
+.vscode/
+.idea/

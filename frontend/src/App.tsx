@@ -12,7 +12,7 @@ import { API_URL } from './types'
 
 function App() {
   // 인증 상태
-  const { isAuthenticated, isLoading: authLoading, user, login, register, logout } = useAuth()
+  const { isAuthenticated, user, login, register, logout } = useAuth()
 
   // 서버 상태
   const [isConnected, setIsConnected] = useState(false)
@@ -25,6 +25,12 @@ function App() {
   const [editedContent, setEditedContent] = useState<string>('')
   const [isSaving, setIsSaving] = useState(false)
 
+  // OnlyOffice 에디터 상태
+  const [isOnlyOfficeMode, setIsOnlyOfficeMode] = useState(false)
+  const [onlyOfficeEditorMode, setOnlyOfficeEditorMode] = useState<'view' | 'edit'>('view')
+  const [onlyOfficeConfig, setOnlyOfficeConfig] = useState<object | null>(null)
+  const [onlyOfficeServerUrl, setOnlyOfficeServerUrl] = useState<string>('')
+
   // UI 상태
   const [activePanel, setActivePanel] = useState<'documents' | 'visualization' | 'history' | null>(null)
   const [isLeftVisible, setIsLeftVisible] = useState(true)
@@ -36,14 +42,9 @@ function App() {
   const [diffData, setDiffData] = useState<any>(null)
 
   // 🆕 전역 알림(Toast) 상태
-  const [toasts, setToasts] = useState<{ id: string, message: string, type: 'success' | 'error' | 'info' }[]>([])
-
   const addToast = (message: string, type: 'success' | 'error' | 'info' = 'success') => {
-    const id = Math.random().toString(36).substr(2, 9)
-    setToasts(prev => [...prev, { id, message, type }])
-    setTimeout(() => {
-      setToasts(prev => prev.filter(t => t.id !== id))
-    }, 5000)
+    // Toast 알림 (콘솔로 대체)
+    console.log(`[${type.toUpperCase()}] ${message}`)
   }
 
   // 백엔드 연결 확인
@@ -67,92 +68,142 @@ function App() {
   }, [])
 
   const handleDocumentSelect = async (docId: string, content?: string) => {
-    setSelectedDocument(docId)
-    if (content) {
-      setDocumentContent(content)
-      setEditedContent(content)
+    try {
+      setSelectedDocument(docId)
+      setIsOnlyOfficeMode(true)
+      setOnlyOfficeEditorMode('view')
       setIsEditing(false)
-    } else {
-      try {
-        const response = await fetch(`${API_URL}/rag/document/${docId}/content`)
+
+      // OnlyOffice 보기 모드 설정 가져오기
+      const response = await fetch(`${API_URL}/onlyoffice/config`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          doc_name: docId,
+          user_name: user?.username || 'Anonymous',
+          mode: 'view',
+        }),
+      })
+
+      if (response.ok) {
         const data = await response.json()
-        if (data.content) {
-          setDocumentContent(data.content)
-          setEditedContent(data.content)
-        } else {
-          setDocumentContent('내용을 불러올 수 없습니다.')
-          setEditedContent('내용을 불러올 수 없습니다.')
+        setOnlyOfficeConfig(data.config)
+        setOnlyOfficeServerUrl(data.onlyoffice_server_url)
+      } else {
+        console.error('OnlyOffice 설정 가져오기 실패')
+        setIsOnlyOfficeMode(false)
+        // 폴백: 텍스트 콘텐츠 로드
+        if (content) {
+          setDocumentContent(content)
+          setEditedContent(content)
         }
-        setIsEditing(false)
-      } catch {
-        setDocumentContent('문서 내용을 가져오는 중 오류가 발생했습니다.')
-        setEditedContent('문서 내용을 가져오는 중 오류가 발생했습니다.')
-        setIsEditing(false)
+      }
+    } catch (error) {
+      console.error('OnlyOffice 초기화 오류:', error)
+      setIsOnlyOfficeMode(false)
+      // 폴백: 텍스트 콘텐츠 로드
+      if (content) {
+        setDocumentContent(content)
+        setEditedContent(content)
       }
     }
   }
 
   const handleSaveDocument = async () => {
     if (!selectedDocument) return
-    setIsSaving(true) // 버튼 비활성화용
+    setIsSaving(true)
     try {
       const response = await fetch(`${API_URL}/rag/document/save`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ doc_name: selectedDocument, content: editedContent }),
       })
-
-      const data = await response.json()
-
       if (response.ok) {
-        addToast(`'${selectedDocument}' 수정 요청이 접수되었습니다. 배경 분석 중...`, 'info')
+        const data = await response.json()
         setDocumentContent(editedContent)
         setIsEditing(false)
-
-        // 🆕 비동기 완료 감지를 위한 이벤트 발송 (DocumentManagementPanel 등에서 수신 가능)
-        window.dispatchEvent(new CustomEvent('document_processing_start', {
-          detail: { docName: selectedDocument, type: 'save' }
-        }))
-
+        alert(`문서가 저장되었습니다. (새 버전: ${data.version})`)
       } else {
-        addToast(`저장 요청 실패: ${data.detail || '알 수 없는 오류'}`, 'error')
+        const errorData = await response.json()
+        alert(`저장 실패: ${errorData.detail || '알 수 없는 오류'}`)
       }
-    } catch (error) {
-      console.error('저장 에러:', error)
-      addToast('저장 중 연결 오류가 발생했습니다.', 'error')
+    } catch {
+      alert('저장 중 오류가 발생했습니다.')
     } finally {
       setIsSaving(false)
     }
   }
 
+  const handleOpenInEditor = async (docId: string) => {
+    try {
+      setSelectedDocument(docId)
+      setIsOnlyOfficeMode(true)
+      setOnlyOfficeEditorMode('edit')
+
+      // OnlyOffice 설정 가져오기
+      const response = await fetch(`${API_URL}/onlyoffice/config`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          doc_name: docId,
+          user_name: user?.username || 'Anonymous',
+          mode: 'edit',
+        }),
+      })
+
+      if (response.ok) {
+        const data = await response.json()
+        setOnlyOfficeConfig(data.config)
+        setOnlyOfficeServerUrl(data.onlyoffice_server_url)
+      } else {
+        console.error('OnlyOffice 설정 가져오기 실패')
+        setIsOnlyOfficeMode(false)
+      }
+    } catch (error) {
+      console.error('OnlyOffice 초기화 오류:', error)
+      setIsOnlyOfficeMode(false)
+    }
+  }
+
+  const handleSwitchToEditMode = async () => {
+    if (!selectedDocument) return
+    try {
+      setOnlyOfficeEditorMode('edit')
+
+      // OnlyOffice 편집 모드 설정 가져오기
+      const response = await fetch(`${API_URL}/onlyoffice/config`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          doc_name: selectedDocument,
+          user_name: user?.username || 'Anonymous',
+          mode: 'edit',
+        }),
+      })
+
+      if (response.ok) {
+        const data = await response.json()
+        setOnlyOfficeConfig(data.config)
+        setOnlyOfficeServerUrl(data.onlyoffice_server_url)
+      } else {
+        console.error('편집 모드 전환 실패')
+      }
+    } catch (error) {
+      console.error('편집 모드 전환 오류:', error)
+    }
+  }
+
   const handleCompare = async (docName: string, v1: string, v2: string) => {
     try {
-      const response = await fetch(`${API_URL}/rag/document/${encodeURIComponent(docName)}/diff?v1=${v1}&v2=${v2}`)
+      const response = await fetch(`${API_URL}/rag/document/${docName}/compare?v1=${v1}&v2=${v2}`)
       if (response.ok) {
         const data = await response.json()
         setDiffData(data)
         setIsComparing(true)
-        setActivePanel(null) // 사이드 패널 닫기 (공간 확보)
-      } else {
-        const error = await response.json()
-        alert(`비교 실패: ${error.detail || '알 수 없는 오류'}`)
       }
     } catch (error) {
-      console.error('비교 요청 오류:', error)
-      alert('비교 요청 중 오류가 발생했습니다.')
+      console.error('버전 비교 실패:', error)
     }
-  }
-
-  // 인증 로딩 중
-  if (authLoading) {
-    return (
-      <div className="fixed inset-0 flex items-center justify-center" style={{ background: '#0d0d0d' }}>
-        <div className="flex flex-col items-center gap-4">
-          <div className="w-10 h-10 border-4 border-dark-border border-t-accent-blue rounded-full animate-spin" />
-          <span className="text-txt-secondary text-[13px]">인증 확인 중...</span>
-        </div>
-      </div>
-    )
   }
 
   // 미인증 → 로그인 모달
@@ -176,56 +227,54 @@ function App() {
 
           {selectedDocument && (
             <div className="flex gap-2 ml-4">
-              {!isEditing ? (
+              {isOnlyOfficeMode && onlyOfficeEditorMode === 'view' ? (
+                <button
+                  className="bg-dark-hover border border-dark-border text-accent py-1 px-3 text-[11px] rounded cursor-pointer transition-all duration-200 hover:bg-dark-border hover:border-txt-secondary"
+                  onClick={handleSwitchToEditMode}
+                >
+                  수정
+                </button>
+              ) : !isEditing && !isOnlyOfficeMode ? (
                 <button
                   className="bg-dark-hover border border-dark-border text-accent py-1 px-3 text-[11px] rounded cursor-pointer transition-all duration-200 hover:bg-dark-border hover:border-txt-secondary"
                   onClick={() => setIsEditing(true)}
                 >
                   수정
                 </button>
-              ) : (
+              ) : isEditing && !isOnlyOfficeMode ? (
                 <>
                   <button
-                    className="bg-dark-hover border border-dark-border text-[#f48fb1] py-1 px-3 text-[11px] rounded cursor-pointer transition-all duration-200 hover:bg-dark-border hover:border-txt-secondary disabled:opacity-50 disabled:cursor-not-allowed"
+                    className="bg-dark-hover border border-dark-border text-[#f48fb1] py-1 px-3 text-[11px] rounded cursor-pointer transition-all duration-200 hover:bg-dark-border hover:border-txt-secondary"
                     onClick={() => { setIsEditing(false); setEditedContent(documentContent || '') }}
-                    disabled={isSaving}
                   >
                     취소
                   </button>
                   <button
-                    className="bg-accent-blue text-white border-accent-blue py-1 px-3 text-[11px] rounded cursor-pointer transition-all duration-200 hover:bg-[#0062a3] disabled:opacity-50 disabled:cursor-not-allowed"
+                    className="bg-accent-blue text-white border-accent-blue py-1 px-3 text-[11px] rounded cursor-pointer transition-all duration-200 hover:bg-[#0062a3]"
                     onClick={handleSaveDocument}
-                    disabled={isSaving}
                   >
-                    {isSaving ? '저장 중...' : '저장'}
+                    저장
                   </button>
                 </>
-              )}
+              ) : null}
             </div>
           )}
         </div>
 
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-2">
+          <span className="text-[12px] text-txt-secondary">
+            <span className="text-accent-blue font-medium">{user?.name || user?.username}</span>
+            {user?.dept && <span className="text-txt-muted ml-1">({user.dept})</span>}
+          </span>
+          <button
+            onClick={logout}
+            className="bg-transparent border border-dark-border text-txt-muted py-0.5 px-2 text-[11px] rounded cursor-pointer transition-all duration-200 hover:bg-dark-hover hover:text-[#f48771] hover:border-[#f48771]/30"
+          >
+            로그아웃
+          </button>
           <span className={`text-[12px] ${isConnected ? 'text-accent' : 'text-[#f48771]'}`}>
             {isConnected ? '[OK]' : '[ERROR]'} {agentStatus}
           </span>
-
-          {/* 사용자 정보 & 로그아웃 */}
-          {user && (
-            <div className="flex items-center gap-2 ml-1 pl-3 border-l border-dark-border">
-              <span className="text-[12px] text-txt-secondary">
-                <span className="text-accent-blue font-medium">{user.name || user.username}</span>
-                {user.dept && <span className="text-txt-muted ml-1">({user.dept})</span>}
-              </span>
-              <button
-                onClick={logout}
-                className="bg-transparent border border-dark-border text-txt-muted py-0.5 px-2 text-[11px] rounded cursor-pointer transition-all duration-200 hover:bg-dark-hover hover:text-[#f48771] hover:border-[#f48771]/30"
-              >
-                로그아웃
-              </button>
-            </div>
-          )}
-
           <button
             className={`border-none py-1 px-2 text-[14px] rounded cursor-pointer flex items-center justify-center transition-all duration-200 ${isRightVisible ? 'bg-transparent text-txt-secondary hover:bg-dark-hover hover:text-accent' : 'bg-accent/10 text-accent'}`}
             onClick={() => setIsRightVisible(!isRightVisible)}
@@ -249,10 +298,14 @@ function App() {
             <DocumentManagementPanel
               onDocumentSelect={handleDocumentSelect}
               onNotify={addToast}
+              onOpenInEditor={handleOpenInEditor}
             />
           )}
           {activePanel === 'history' && (
-            <ChangeHistoryPanel onCompare={handleCompare} selectedDocName={selectedDocument} />
+            <ChangeHistoryPanel
+              onCompare={handleCompare}
+              selectedDocName={selectedDocument}
+            />
           )}
         </div>
 
@@ -294,13 +347,17 @@ function App() {
                 setDiffData(null)
               }}
             />
-          ) : selectedDocument && documentContent ? (
+          ) : selectedDocument && (documentContent || isOnlyOfficeMode) ? (
             <DocumentViewer
               selectedDocument={selectedDocument}
               documentContent={documentContent}
               isEditing={isEditing}
               editedContent={editedContent}
               setEditedContent={setEditedContent}
+              isOnlyOfficeMode={isOnlyOfficeMode}
+              onlyOfficeEditorMode={onlyOfficeEditorMode}
+              onlyOfficeConfig={onlyOfficeConfig}
+              onlyOfficeServerUrl={onlyOfficeServerUrl}
             />
           ) : (
             <div className="flex-1 flex flex-col items-center justify-center text-txt-secondary">
@@ -317,35 +374,16 @@ function App() {
         />
       </div>
 
-      {/* 🆕 품격 있는 Toast 알림 */}
-      <div className="fixed top-12 right-6 z-[3000] flex flex-col gap-3 pointer-events-none">
-        {toasts.map(toast => (
-          <div
-            key={toast.id}
-            className={`pointer-events-auto min-w-[300px] p-4 rounded-lg shadow-2xl border flex items-center gap-3 animate-slide-in-right
-              ${toast.type === 'success' ? 'bg-[#1e1e1e] border-[#4ec9b0] text-[#4ec9b0]' :
-                toast.type === 'error' ? 'bg-[#1e1e1e] border-[#f48771] text-[#f48771]' :
-                  'bg-[#1e1e1e] border-accent-blue text-accent-blue'}`}
-          >
-            <span className="text-[18px]">
-              {toast.type === 'success' ? '✓' : toast.type === 'error' ? '⚠' : 'ℹ'}
-            </span>
-            <div className="flex-1">
-              <p className="m-0 text-[13px] font-medium leading-normal">{toast.message}</p>
-            </div>
+      {/* 저장 중 오버레이 */}
+      {isSaving && (
+        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-[2000]">
+          <div className="bg-[#2d2d2d] border border-dark-border rounded-lg p-8 flex flex-col items-center gap-4 text-center">
+            <div className="w-10 h-10 border-4 border-dark-border border-t-accent-blue rounded-full animate-spin"></div>
+            <p className="text-txt-primary text-[14px] m-0">문서를 분석하고 저장하는 중입니다...</p>
+            <span className="text-txt-secondary text-[12px]">이 작업은 최대 1분 정도 소요될 수 있습니다.</span>
           </div>
-        ))}
-      </div>
-
-      <style>{`
-        @keyframes slide-in-right {
-          from { transform: translateX(100%); opacity: 0; }
-          to { transform: translateX(0); opacity: 1; }
-        }
-        .animate-slide-in-right {
-          animation: slide-in-right 0.3s ease-out forwards;
-        }
-      `}</style>
+        </div>
+      )}
     </div>
   )
 }

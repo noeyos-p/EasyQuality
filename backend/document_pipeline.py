@@ -412,6 +412,105 @@ def parse_clauses(markdown: str, max_level: int = None) -> List[Dict]:
     return clauses
 
 
+def parse_docx_clauses(docx_content: bytes) -> List[Dict]:
+    """
+    DOCX 파일의 다단계 목록 구조(ilvl)를 읽어 조항 구조 생성.
+
+    Normal 스타일 + numPr ilvl 값으로 계층 판단:
+      ilvl=0 → 대분류 (level 0)
+      ilvl=1 → 중분류 (level 1)
+      ilvl=2 → 소분류 (level 2)
+    List Paragraph / ilvl 없는 Normal → 본문 content
+
+    Heading 스타일도 함께 지원 (혼합 문서 대응)
+    """
+    from docx import Document as DocxDocument
+    from docx.oxml.ns import qn
+    from io import BytesIO
+
+    doc = DocxDocument(BytesIO(docx_content))
+
+    def get_ilvl(para) -> int | None:
+        """numPr에서 ilvl 값 추출"""
+        numPr = para._element.find('.//' + qn('w:numPr'))
+        if numPr is not None:
+            ilvl_elem = numPr.find(qn('w:ilvl'))
+            if ilvl_elem is not None:
+                try:
+                    return int(ilvl_elem.get(qn('w:val'), -1))
+                except (ValueError, TypeError):
+                    pass
+        return None
+
+    def get_heading_level(style_name: str) -> int | None:
+        """Heading 1~6 / 제목 1~6 스타일에서 레벨 추출"""
+        for prefix in ("Heading ", "제목 "):
+            if style_name.startswith(prefix):
+                try:
+                    return int(style_name[len(prefix):]) - 1
+                except ValueError:
+                    pass
+        return None
+
+    counters = [0] * 9
+    clauses = []
+    current_clause = None
+    content_lines = []
+
+    def flush_clause():
+        nonlocal current_clause, content_lines
+        if current_clause is not None:
+            current_clause["content"] = "\n".join(content_lines).strip()
+            if current_clause["title"] or len(current_clause["content"]) >= 3:
+                clauses.append(current_clause)
+        current_clause = None
+        content_lines = []
+
+    def make_clause(level: int, title: str):
+        nonlocal current_clause, content_lines
+        flush_clause()
+        counters[level] += 1
+        for i in range(level + 1, len(counters)):
+            counters[i] = 0
+        clause_num = ".".join(str(counters[i]) for i in range(level + 1))
+        current_clause = {
+            "clause": clause_num,
+            "title": title,
+            "content": "",
+            "level": level,
+            "page": 1,
+        }
+        content_lines = []
+
+    for para in doc.paragraphs:
+        style_name = para.style.name if para.style else "Normal"
+        text = para.text.strip()
+        if not text:
+            continue
+
+        ilvl = get_ilvl(para)
+        heading_level = get_heading_level(style_name)
+
+        if heading_level is not None:
+            # Word 헤딩 스타일 우선
+            make_clause(heading_level, text)
+        elif ilvl is not None and style_name == "Normal":
+            # Normal + ilvl → 구조적 항목
+            make_clause(ilvl, text)
+        else:
+            # List Paragraph 또는 ilvl 없는 일반 본문
+            if current_clause is not None:
+                content_lines.append(text)
+            else:
+                # 조항 없이 시작하는 본문 → 가상 최상위 조항
+                make_clause(0, text[:100])
+
+    flush_clause()
+
+    print(f"    ✓ Word 다단계 목록 기반 {len(clauses)}개 조항 추출")
+    return clauses
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 4단계: 메타데이터 추출 (evaluate_gmp_unified 방식)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -644,6 +743,9 @@ def process_document(
                 markdown = content.decode('utf-8')
             else:
                 markdown = content
+        elif file_ext in ['.docx', '.doc']:
+            print(f"\n[1/4] DOCX → 마크다운 변환")
+            markdown = docx_to_markdown(content)
         else:
             print("\n[1/4] PDF → 마크다운 변환")
             markdown = pdf_to_markdown(content)
@@ -653,11 +755,17 @@ def process_document(
         clauses = parse_clauses(markdown, max_level=max_clause_level)
 
         if not clauses:
-            return {
-                "success": False,
-                "chunks": [],
-                "errors": ["조항을 찾을 수 없습니다."]
-            }
+            if file_ext in ['.docx', '.doc']:
+                # DOCX는 Word 헤딩 스타일로 재시도
+                print("    숫자 조항 없음 → Word 헤딩 스타일로 재파싱")
+                clauses = parse_docx_clauses(content)
+
+            if not clauses:
+                return {
+                    "success": False,
+                    "chunks": [],
+                    "errors": ["조항을 찾을 수 없습니다."]
+                }
             
         # 2.5 지능형 버전 추출 (파일명에 없을 경우 본문 분석)
         if not version and use_llm_metadata:

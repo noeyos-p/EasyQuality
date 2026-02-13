@@ -12,37 +12,21 @@ RAG 챗봇 API v14.0 + Agent (OpenAI)
 from dotenv import load_dotenv
 load_dotenv()
 
-from datetime import datetime, timedelta, timezone
-from typing import Optional, List, Dict, Any, Union, Literal
-
-# 한국 시간대 (KST) 정의
-KST = timezone(timedelta(hours=9))
-import re
-from pydantic import BaseModel, Field, field_validator
-from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form, BackgroundTasks, Depends, status
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response, FileResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from passlib.context import CryptContext
-from jose import JWTError, jwt
-import uvicorn
-import os
-import io
-import shutil
-import asyncio
-import json
-import logging
+from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel, Field, field_validator
+from typing import List, Dict, Optional, Literal
 from contextlib import asynccontextmanager
 import torch
 import time
 import re
 import uuid
+import json
+import os
 from io import BytesIO
 
-import backend.agent as agent_module
 from backend.sql_store import SQLStore
-
 sql_store = SQLStore()
 # sql_store.init_db()  #  main()으로 이동하여 중복 호출 방지
 
@@ -113,8 +97,6 @@ class LLMRequest(BaseModel):
     max_tokens: int = 256
     temperature: float = 0.1
 
-# 부서/직책 기본 목록 (DB에 데이터가 없을 때 사용)
-
 class DeleteDocRequest(BaseModel):
     doc_name: str
     collection: str = "documents"
@@ -132,9 +114,6 @@ PRESET_MODELS = {
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 chat_histories: Dict[str, List[Dict]] = {}
-chat_results: Dict[str, Dict] = {}  # 🆕 비동기 채팅 결과 저장소
-chat_queue: asyncio.Queue = asyncio.Queue()  # 🆕 순차 처리를 위한 대기열
-chat_pending_ids: List[str] = []  # 🆕 현재 대기 중인 요청 ID 목록 (순번 계산용)
 _graph_store = None
 
 def get_graph_store():
@@ -167,19 +146,9 @@ except ImportError as e:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    print("🚀 채팅 워커(Worker) 가동 중...")
-    worker_task = asyncio.create_task(chat_worker())
-    
     yield
-    
     # Shutdown
     print("\n 서버 종료 중...")
-    worker_task.cancel()
-    try:
-        await worker_task
-    except asyncio.CancelledError:
-        print(" 채팅 워커 종료됨")
-        
     vector_store.close_client()
     if _graph_store:
         _graph_store.close()
@@ -408,147 +377,51 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 인증 (Authentication) 및 사용자 관리
-# ═══════════════════════════════════════════════════════════════════════════
 
-# === Auth Configuration ===
-SECRET_KEY = "super-secret-key-change-this-in-production"  # TODO: 환경변수로 이동
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24시간
-
-# === Security Context ===
-pwd_context = CryptContext(schemes=["pbkdf2_sha256", "bcrypt"], deprecated="auto")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login")
-
-# === Auth Models ===
-class Token(BaseModel):
-    access_token: str
-    token_type: str
-    user: Dict
-
-class TokenData(BaseModel):
-    username: Optional[str] = None
-
-class UserRegister(BaseModel):
-    username: str
-    password: str
-    name: str
-    email: str
-    rank: Optional[str] = None
-    dept: Optional[str] = None
-
-    @field_validator("email")
-    @classmethod
-    def validate_email(cls, v):
-        if not v:
-            return v
-        regex = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
-        if not re.match(regex, v):
-            raise ValueError("올바른 이메일 형식이 아닙니다.")
-        return v
-
-class UserLogin(BaseModel):
-    username: str
-    password: str
-
-class UserSnippet(BaseModel):
-    username: str
-    name: str
-
-class PasswordReset(BaseModel):
-    user_id: int
-    new_password: str
-
-class FindUsernameRequest(BaseModel):
-    name: str
-    dept: Optional[str] = None
-
-# === Auth Utils ===
-def verify_password(plain_password, hashed_password):
-    return pwd_context.verify(plain_password, hashed_password)
-
-def get_password_hash(password):
-    return pwd_context.hash(password)
-
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
-    to_encode = data.copy()
-    now_kst = datetime.now(KST)
-    if expires_delta:
-        expire = now_kst + expires_delta
-    else:
-        expire = now_kst + timedelta(minutes=15)
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
-
-async def get_current_user(token: str = Depends(oauth2_scheme)):
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username: str = payload.get("sub")
-        if username is None:
-            raise credentials_exception
-        token_data = TokenData(username=username)
-    except JWTError:
-        raise credentials_exception
-    
-    user = sql_store.get_user_by_username(token_data.username)
-    if user is None:
-        raise credentials_exception
-    return user
-
-oauth2_scheme_optional = OAuth2PasswordBearer(tokenUrl="auth/login", auto_error=False)
-
-async def get_current_user_optional(token: Optional[str] = Depends(oauth2_scheme_optional)):
-    if not token: return None
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username: str = payload.get("sub")
-        if username is None: return None
-    except JWTError:
-        return None
-    return sql_store.get_user_by_username(username)
-
-
-def process_save_task(
-    doc_name: str,
-    content: str,
-    collection: str,
-    model: str
-):
+@app.post("/rag/document/save")
+async def save_document_content(request: SaveDocRequest):
     """
-    문서 수정을 수행하는 배경 작업 함수
+    수정된 문서 내용을 저장하고 DB 동기화
+    1. 본문에서 버전 추출 (재분석)
+    2. RDB에 신규 버전 INSERT
+    3. 기존 그래프/벡터 DB 삭제 후 재업로드 (Overwrite)
     """
     start_time = time.time()
+    doc_name = request.doc_name
+    content = request.content
+    
+    print(f"\n{'='*70}")
+    print(f"문서 수정 저장 [V2]: {doc_name}")
+    print(f"{'='*70}\n")
+    
     try:
-        print(f"\n[Background Task] 문서 수정 저장 처리 시작: {doc_name}")
-        
         # 1. 문서 재분석 (파이프라인 재사용)
+        print(f"[1단계] 수정본 분석 및 버전 추출")
         content_bytes = content.encode('utf-8')
-        model_path = resolve_model_path(model)
+        
+        model_path = resolve_model_path(request.model)
         embed_model = SentenceTransformer(model_path)
         
+        # 파이프라인 실행
         result = process_document(
             file_path=f"{doc_name}.md",
             content=content_bytes,
-            use_llm_metadata=True,
+            use_llm_metadata=True, # 메타데이터 및 버전 추출을 위해 활성화
             embed_model=embed_model
         )
         
         if not result.get("success"):
-            print(f"  🔴 [Task 실패] 분석 실패: {result.get('errors')}")
-            return
+            raise HTTPException(400, f"🔴 분석 실패: {result.get('errors')}")
             
         final_version = result.get("version", "1.0")
         chunks_data = result["chunks"]
         doc_id = result.get("doc_id", doc_name)
         
-        # 2. 기존 검색 데이터 삭제
-        vector_store.delete_by_doc_name(doc_name, collection_name=collection)
+        print(f"  🟢 분석 완료: 버전 {final_version} 감지됨\n")
+        
+        # 2. 기존 검색 데이터 삭제 (Overwrite 정제)
+        print(f"[2단계] 기존 검색 인덱스 삭제 (Overwrite 준비)")
+        vector_store.delete_by_doc_name(doc_name, collection_name=request.collection)
         
         try:
             graph = get_graph_store()
@@ -558,11 +431,14 @@ def process_save_task(
                     sop_match = re.search(r'([A-Z]+-[A-Z]+-\d+)', doc_name, re.IGNORECASE)
                     if sop_match:
                         sop_id = sop_match.group(1).upper()
+                
                 graph.delete_document(sop_id)
+                print(f"  🟢 Neo4j 기존 데이터 삭제 완료 ({sop_id})")
         except Exception as ge:
-            print(f"  ⚠ Neo4j 삭제 실패: {ge}")
+            print(f"  ⚠ Neo4j 삭제 실패 (무시): {ge}")
 
         # 3. RDB 신규 버전 저장
+        print(f"\n[3단계] PostgreSQL 신규 버전 저장")
         doc_id_db = sql_store.save_document(
             doc_name=doc_name,
             content=content,
@@ -580,62 +456,55 @@ def process_save_task(
                 for c in chunks_data
             ]
             sql_store.save_chunks_batch(doc_id_db, batch_chunks)
+            print(f"  🟢 RDB 저장 완료\n")
         
         # 4. 벡터 DB 재업로드
+        print(f"[4단계] Weaviate 벡터 재업로드")
         texts = [c["text"] for c in chunks_data]
-        metadatas = [{**c["metadata"], "chunk_method": "article", "model": model, "pipeline_version": "edit-save-v14.0"} for c in chunks_data]
+        metadatas = [
+            {
+                **c["metadata"],
+                "chunk_method": "article",
+                "model": request.model,
+                "pipeline_version": "edit-save-v2.0", # 버전 상향
+            }
+            for c in chunks_data
+        ]
         
         vector_store.add_documents(
             texts=texts,
             metadatas=metadatas,
-            collection_name=collection,
+            collection_name=request.collection,
             model_name=model_path
         )
+        print(f"  🟢 벡터 저장 완료\n")
         
         # 5. 그래프 DB 재업로드
+        print(f"[5단계] Neo4j 그래프 재업로드")
         try:
             graph = get_graph_store()
             if graph.test_connection():
                 _upload_to_neo4j_from_pipeline(graph, result, f"{doc_name}.md")
-        except: pass
+                print(f"  🟢 그래프 저장 완료\n")
+        except Exception as ge:
+            print(f"  ⚠ Neo4j 업로드 실패 (무시): {ge}")
             
         elapsed = round(time.time() - start_time, 2)
-        print(f"\n[Background Task] 🟢 수정 저장 완료 ({elapsed}초): {doc_name}")
-        
-    except Exception as e:
-        print(f"  🔴 [Background Task 에러] {str(e)}")
-        import traceback
-        traceback.print_exc()
-
-
-@app.post("/rag/document/save")
-async def save_document_content(background_tasks: BackgroundTasks, request: SaveDocRequest):
-    """
-    수정된 문서 내용을 저장하고 DB 동기화 (비동기 v14.0)
-    """
-    try:
-        print(f"\n{'='*70}")
-        print(f"문서 수정 저장 요청 접수: {request.doc_name}")
-        print(f"  처리 방식: 비동기 (Background Tasks)")
+        print(f"{'='*70}")
+        print(f"🟢 수정 저장 완료 [V2] ({elapsed}초)")
         print(f"{'='*70}\n")
-
-        background_tasks.add_task(
-            process_save_task,
-            doc_name=request.doc_name,
-            content=request.content,
-            collection=request.collection,
-            model=request.model
-        )
-
+        
         return {
             "success": True,
-            "message": f"'{request.doc_name}' 문서의 수정 사항이 접수되었습니다. 분석 및 동기화가 배경에서 진행됩니다.",
-            "doc_name": request.doc_name,
-            "processing_mode": "background"
+            "doc_name": doc_name,
+            "version": final_version,
+            "elapsed": elapsed
         }
         
     except Exception as e:
-        raise HTTPException(500, f"저장 요청 실패: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, f"저장 중 오류 발생: {str(e)}")
 
 
 
@@ -739,32 +608,48 @@ def list_llm_models():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ═══════════════════════════════════════════════════════════════════════════
-#  API 엔드포인트 - 업로드 (LangGraph v9.2 - 비동기 배경 작업)
+#  API 엔드포인트 - 업로드 (LangGraph v9.2)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def process_upload_task(
-    filename: str,
-    content: bytes,
-    collection: str,
-    chunk_size: int,
-    chunk_method: str,
-    model: str,
-    overlap: int,
-    use_langgraph: bool,
-    use_llm_metadata: bool,
-    version: Optional[str] = None
+@app.post("/rag/upload")
+async def upload_document(
+    file: UploadFile = File(...),
+    collection: str = Form("documents"),
+    chunk_size: int = Form(DEFAULT_CHUNK_SIZE),
+    chunk_method: str = Form(DEFAULT_CHUNK_METHOD),
+    model: str = Form("multilingual-e5-small"),
+    overlap: int = Form(DEFAULT_OVERLAP),
+    use_langgraph: bool = Form(True),  #  LangGraph 사용 여부
+    use_llm_metadata: bool = Form(True),  #  LLM 메타데이터 추출 사용 여부
+    version: Optional[str] = Form(None), # 사용자가 직접 지정하는 버전
 ):
     """
-    문서 처리를 수행하는 배경 작업 함수
+    문서 업로드 (LangGraph v9.2 파이프라인)
+    
+    - ChromaDB에 벡터 저장
+    - Neo4j에 그래프 저장
+    - 페이지 번호, Parent-Child 계층 메타데이터 포함
     """
     start_time = time.time()
+    
     try:
-        print(f"\n[Background Task] 문서 업로드 처리 시작: {filename}")
+        content = await file.read()
+        filename = file.filename
         
+        print(f"\n{'='*70}")
+        print(f"문서 업로드: {filename}")
+        print(f"{'='*70}\n")
+
         # ========================================
         # 문서 파싱
         # ========================================
+        print(f"[1단계] 문서 파싱")
+        print(f"  파이프라인: PDF 조항 v2.0")
+        print(f"  LLM 메타데이터: {'🟢 활성' if use_llm_metadata else '비활성'}")
+        if use_llm_metadata:
+            print(f"  LLM 모델: gpt-4o-mini")
+        print()
+
         model_path = resolve_model_path(model)
         embed_model = SentenceTransformer(model_path)
 
@@ -777,24 +662,35 @@ def process_upload_task(
 
         if not result.get("success"):
             errors = result.get("errors", ["알 수 없는 오류"])
-            print(f"  🔴 [Task 실패] 문서 처리 실패: {errors}")
-            return
+            raise HTTPException(400, f"🔴 문서 처리 실패: {errors}")
 
         chunks_data = result["chunks"]
         if not chunks_data:
-            print("  🔴 [Task 실패] 텍스트 추출 실패")
-            return
+            raise HTTPException(400, "🔴 텍스트 추출 실패")
+
+        from dataclasses import dataclass
+        @dataclass
+        class Chunk:
+            text: str
+            metadata: dict
+            index: int = 0
 
         chunks = [Chunk(text=c["text"], metadata=c["metadata"], index=c["index"]) for c in chunks_data]
         doc_id = result.get("doc_id")
         doc_title = result.get("doc_title")
         pipeline_version = "pdf-clause-v2.0"
 
-        print(f"  🟢 파싱 완료: {doc_id} ({len(chunks)}개 청크)")
+        print(f"  🟢 파싱 완료")
+        print(f"     • ID: {doc_id}")
+        print(f"     • 제목: {doc_title}")
+        print(f"     • 조항: {result.get('total_clauses')}개")
+        print(f"     • 청크: {len(chunks)}개\n")
         
         # ========================================
         # Weaviate 벡터 저장
         # ========================================
+        print(f"[2단계] Weaviate 벡터 저장")
+
         texts = [c.text for c in chunks]
         metadatas = [
             {
@@ -812,21 +708,29 @@ def process_upload_task(
             collection_name=collection,
             model_name=model_path
         )
-        print(f"  🟢 Weaviate 저장 완료")
+        print(f"  🟢 저장 완료: {len(chunks)}개 청크\n")
         
         # ========================================
         # PostgreSQL 문서 저장
         # ========================================
+        print(f"[3단계] PostgreSQL 저장")
+
         try:
+            # PDF에서 추출한 원본 텍스트 그대로 사용 (조항 번호 포함)
             original_text = result.get("markdown", "")
             if not original_text:
+                # fallback: 청크들을 합침
                 original_text = "\n\n".join([c.text for c in chunks])
 
+            # 파이프라인에서 추출된 버전 또는 사용자 입력 버전 결정
             final_version = version or result.get("version", "1.0")
             
+            if final_version != "1.0":
+                print(f"     [추출] 최종 결정된 버전: {final_version}")
+
             doc_id_db = sql_store.save_document(
                 doc_name=doc_id,
-                content=original_text,
+                content=original_text,  # PDF 원본 텍스트 그대로 저장
                 doc_type=filename.split('.')[-1] if '.' in filename else None,
                 version=final_version
             )
@@ -841,83 +745,66 @@ def process_upload_task(
                     for c in chunks
                 ]
                 sql_store.save_chunks_batch(doc_id_db, batch_chunks)
-                print(f"  🟢 PostgreSQL 저장 완료")
+                print(f"  🟢 저장 완료: 문서 + {len(chunks)}개 청크\n")
+            else:
+                print(f"  🔴 저장 실패: DB 저장에 실패했습니다 (ID 생성 불가)\n")
         except Exception as sql_err:
-            print(f"  🔴 PostgreSQL 저장 실패: {sql_err}")
+            print(f"  🔴 저장 실패: {sql_err}\n")
 
         # ========================================
         # Neo4j 그래프 저장
         # ========================================
+        print(f"[4단계] Neo4j 그래프 저장")
+        graph_uploaded = False
+        graph_sections = 0
+
         try:
+            from backend.graph_store import Neo4jGraphStore
+
             graph = get_graph_store()
             if graph.test_connection():
                 _upload_to_neo4j_from_pipeline(graph, result, filename)
-                print(f"  🟢 Neo4j 저장 완료")
+                graph_uploaded = True
+                stats = graph.get_graph_stats()
+                graph_sections = stats.get("sections", 0)
+                print(f"  🟢 저장 완료: {graph_sections}개 섹션\n")
         except Exception as graph_error:
-            print(f"  🔴 Neo4j 저장 실패: {graph_error}")
+            # [디버그 로그 보강] 연결 실패 시 구체적인 에러 메시지 출력
+            print(f"  🔴 Neo4j 연결 실패: {graph_error}")
+            import traceback
+            traceback.print_exc()
+            print(f"  ⚠ 그래프 연동을 건너뛰고 계속 진행합니다.\n")
         
+        # ========================================
+        # 완료
+        # ========================================
         elapsed = round(time.time() - start_time, 2)
-        print(f"\n[Background Task] 🟢 업로드 처리 완료 ({elapsed}초): {filename}")
 
-    except Exception as e:
-        print(f"  🔴 [Background Task 에러] {str(e)}")
-        import traceback
-        traceback.print_exc()
-
-@app.post("/rag/upload")
-async def upload_document(
-    background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
-    collection: str = Form("documents"),
-    chunk_size: int = Form(DEFAULT_CHUNK_SIZE),
-    chunk_method: str = Form(DEFAULT_CHUNK_METHOD),
-    model: str = Form("multilingual-e5-small"),
-    overlap: int = Form(DEFAULT_OVERLAP),
-    use_langgraph: bool = Form(True),
-    use_llm_metadata: bool = Form(True),
-    version: Optional[str] = Form(None),
-):
-    """
-    문서 업로드 (비동기 배경 작업 v14.0)
-    
-    - 파일을 즉시 수신하고 배경 작업으로 처리를 넘김
-    - 사용자는 즉시 성공 응답을 받음
-    """
-    try:
-        content = await file.read()
-        filename = file.filename
-        
-        print(f"\n{'='*70}")
-        print(f"문서 업로드 요청 접수: {filename}")
-        print(f"  처리 방식: 비동기 (Background Tasks)")
+        print(f"{'='*70}")
+        print(f"🟢 업로드 완료 ({elapsed}초)")
         print(f"{'='*70}\n")
-
-        # 배경 작업 등록
-        background_tasks.add_task(
-            process_upload_task,
-            filename=filename,
-            content=content,
-            collection=collection,
-            chunk_size=chunk_size,
-            chunk_method=chunk_method,
-            model=model,
-            overlap=overlap,
-            use_langgraph=use_langgraph,
-            use_llm_metadata=use_llm_metadata,
-            version=version
-        )
 
         return {
             "success": True,
-            "message": f"'{filename}' 문서의 업로드가 시작되었습니다. 처리가 완료되는 동안 다른 작업을 수행하실 수 있습니다.",
             "filename": filename,
-            "processing_mode": "background"
+            "doc_id": doc_id,
+            "doc_title": doc_title,
+            "version": final_version,
+            "chunks": len(chunks),
+            "total_clauses": result.get("total_clauses"),
+            "chunk_method": chunk_method,
+            "pipeline_version": pipeline_version,
+            "graph_uploaded": graph_uploaded,
+            "elapsed_seconds": elapsed,
+            "sample_metadata": metadatas[0] if metadatas else {},
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         import traceback
         traceback.print_exc()
-        raise HTTPException(500, f"🔴 요청 실패: {str(e)}")
+        raise HTTPException(500, f"🔴 실패: {str(e)}")
 
 
 def _upload_to_neo4j_from_pipeline(graph, result: dict, filename: str):
@@ -937,159 +824,105 @@ def _upload_to_neo4j_from_pipeline(graph, result: dict, filename: str):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# API 엔드포인트 - 챗봇 (순차 대기열 처리 v14.1)
+# API 엔드포인트 - 챗봇
 # ═══════════════════════════════════════════════════════════════════════════
 
-async def chat_worker():
+@app.post("/chat")
+def chat(request: ChatRequest):
     """
-    큐에서 질문을 하나씩 꺼내어 순차적으로 답변을 생성하는 워커
+    Main Agent Chat Endpoint
+    - Manual RAG 로직 제거됨
+    - 오직 Agent Orchestrator를 통해서만 답변
     """
-    while True:
-        # v14.2: user_id 추가 (튜플 언패킹: 3개 요소)
-        item = await chat_queue.get()
-        if len(item) == 3:
-            request_id, request, user_id = item
-        else:
-            request_id, request = item
-            user_id = None
+    print(f" [Agent] 요청 수신: {request.message}")
+    
+    try:
+        # Agent 실행
+        # llm.py 업데이트에 따라 model_name 파라미터 등을 적절히 전달
+        init_agent_tools(vector_store, get_graph_store(), sql_store)
+        
+        response = run_agent(
+            query=request.message,
+            session_id=request.session_id or str(uuid.uuid4()),
+            model_name=request.llm_model or "gpt-4o-mini"
+        )
+
+        answer = response.get("answer")
+
+        # LLM as a Judge 평가
+        evaluation_scores = None
+
+        # 에러 메시지 패턴 감지
+        error_patterns = ["오류가 발생", "에러", "실패", "Error", "Exception", "찾을 수 없", "준비하지 못", "로딩 에러"]
+        is_error_message = any(pattern in answer for pattern in error_patterns)
 
         try:
-            print(f" 🚀 [Chat Worker] 처리 시작: {request_id} (User: {user_id})")
-            # 🆕 처리 시작 시 순번 정보 제거 및 상태 변경
-            chat_results[request_id] = {"status": "processing", "result": None}
-            if "position" in chat_results[request_id]:
-                del chat_results[request_id]["position"]
-            
-            # 현재 대기 목록에서 제거
-            if request_id in chat_pending_ids:
-                chat_pending_ids.remove(request_id)
+            from backend.evaluation import AgentEvaluator
 
-            # Agent 실행 (이벤트 루프 차단을 방지하기 위해 별도 스레드에서 실행)
-            from backend.agent import run_agent, init_agent_tools
-            init_agent_tools(vector_store, get_graph_store(), sql_store)
-            
-            # 🧠 롱텀 메모리: 이전 대화 기록 조회
-            chat_history = []
-            if user_id:
-                try:
-                    chat_history = sql_store.get_conversation_history(user_id, limit=6)
-                    print(f"  🧠 [Memory] 사용자 {user_id}의 대화 기록 {len(chat_history)}건 로드")
-                except Exception as e:
-                    print(f"  ⚠️ [Memory] 조회 실패: {e}")
+            # 평가 생략 조건
+            if len(answer) < 20:
+                print("평가 생략: 답변이 너무 짧음")
+            elif is_error_message:
+                print("평가 생략: 에러 메시지")
+            else:
+                # 평가 실행 (RDB 검증 필수!)
+                evaluator = AgentEvaluator(
+                    judge_model="gpt-4o-mini",
+                    sql_store=sql_store  # ✅ RDB 검증을 위해 필수 전달
+                )
 
-            response = await asyncio.to_thread(
-                run_agent,
-                query=request.message,
-                session_id=request.session_id or str(uuid.uuid4()),
-                model_name=request.llm_model or "gpt-4o-mini",
-                chat_history=chat_history  # 히스토리 전달
-            )
-            
-            answer = response.get("answer")
-            
-            # 🧠 롱텀 메모리: 새로운 대화 저장 (임베딩 포함)
-            if user_id and answer:
-                try:
-                    # 질문 임베딩 생성 (384차원)
-                    try:
-                        from sentence_transformers import SentenceTransformer
-                        # 모델 경로는 기본값 또는 환경에 맞게 조정 (여기서는 직접 지정하거나 기존 패턴 참고)
-                        embed_model = SentenceTransformer("intfloat/multilingual-e5-small")
-                        query_embedding = embed_model.encode(request.message).tolist()
-                    except Exception as e:
-                        print(f"  ⚠️ [Memory] 임베딩 생성 실패: {e}")
-                        query_embedding = None
+                # context 추출 (agent_log에서)
+                context = response.get("agent_log", {}).get("context", "")
+                if isinstance(context, list):
+                    context = "\n\n".join(context)
 
-                    sql_store.save_memory(request.message, answer, user_id, embedding=query_embedding)
-                    print(f"  💾 [Memory] 대화 내용 및 임베딩 저장 완료")
-                except Exception as e:
-                    print(f"  ⚠️ [Memory] 저장 실패: {e}")
+                evaluation_scores = evaluator.evaluate_single(
+                    question=request.message,
+                    answer=answer,
+                    context=context,
+                    metrics=["faithfulness", "groundness", "relevancy", "correctness"]
+                )
 
+                # 로그 출력
+                if evaluation_scores:
+                    print(f"\n{'='*60}")
+                    print(f"평가 결과 (평균: {evaluation_scores.get('average_score', 0)}/5)")
+                    print(f"{'='*60}")
+                    for metric, result in evaluation_scores.items():
+                        # average_score는 건너뜀 (float이므로 .get() 메서드 없음)
+                        if metric == "average_score":
+                            continue
+
+                        score = result.get("score", 0)
+                        reasoning = result.get("reasoning", "")
+                        print(f"\n[{metric.upper()}]")
+                        print(f"  점수: {score}/5")
+                        print(f"  이유: {reasoning}")
+
+                        # RDB 검증 결과 출력
+                        if "rdb_verification" in result:
+                            rdb = result["rdb_verification"]
+                            print(f"  📊 RDB 검증: 정확도 {rdb.get('accuracy_rate', 0)}% ({rdb.get('verified_citations', 0)}/{rdb.get('total_citations', 0)})")
+                    print(f"{'='*60}\n")
+
+        except ImportError:
+            print("평가 모듈 사용 불가 (선택적 기능)")
+        except Exception as eval_error:
+            print(f"평가 실행 실패 (계속 진행): {eval_error}")
             evaluation_scores = None
-            error_patterns = ["오류가 발생", "에러", "실패", "Error", "Exception", "찾을 수 없", "준비하지 못", "로딩 에러"]
-            is_error_message = any(pattern in answer for pattern in error_patterns)
-            
-            try:
-                from backend.evaluation import AgentEvaluator
-                if len(answer) >= 20 and not is_error_message:
-                    evaluator = AgentEvaluator(judge_model="gpt-4o-mini", sql_store=sql_store)
-                    context = response.get("agent_log", {}).get("context", "")
-                    if isinstance(context, list): context = "\n\n".join(context)
-                    
-                    evaluation_scores = evaluator.evaluate_single(
-                        question=request.message,
-                        answer=answer,
-                        context=context,
-                        metrics=["faithfulness", "groundness", "relevancy", "correctness"]
-                    )
-            except Exception as eval_error:
-                print(f"  평가 실행 실패: {eval_error}")
-                
-            result_data = {
-                "session_id": request.session_id,
-                "answer": answer,
-                "sources": [],
-                "agent_log": response,
-                "evaluation_scores": evaluation_scores
-            }
-            
-            chat_results[request_id] = {"status": "completed", "result": result_data}
-            print(f" ✅ [Chat Worker] 처리 완료: {request_id}")
-            
-        except Exception as e:
-            print(f" 🔴 [Chat Worker] 에러: {e}")
-            chat_results[request_id] = {"status": "error", "error": str(e)}
-            if request_id in chat_pending_ids:
-                chat_pending_ids.remove(request_id)
-        finally:
-            chat_queue.task_done()
 
-@app.post("/chat")
-async def chat(request: ChatRequest, current_user: Optional[Dict] = Depends(get_current_user_optional)):
-    """
-    순차 대기열 채팅 엔드포인트
-    - 요청을 즉시 큐에 담고 대기 순번을 반환할 수 있도록 준비
-    - 인증된 사용자(current_user)가 있으면 user_id를 함께 전달하여 롱텀 메모리 기능 활성화
-    """
-    request_id = str(uuid.uuid4())
-    user_id = current_user['id'] if current_user else None
-    
-    print(f" [Agent] 대기열 등록: {request_id} (User: {user_id})")
-    
-    # 상태 초기화
-    chat_results[request_id] = {"status": "waiting", "result": None}
-    chat_pending_ids.append(request_id)
-    
-    # 큐에 추가 (v14.2: user_id 포함)
-    await chat_queue.put((request_id, request, user_id))
-    
-    # 현재 대기 순번 계산 (자신 포함)
-    position = chat_pending_ids.index(request_id) + 1
-    
-    return {
-        "success": True,
-        "request_id": request_id,
-        "message": f"질문이 대기열에 등록되었습니다. (현재 대기 순번: {position}번째)",
-        "status": "waiting",
-        "position": position
-    }
-
-@app.get("/chat/status/{request_id}")
-async def get_chat_status(request_id: str):
-    """채팅 작업의 상태와 대기 순번 조회"""
-    if request_id not in chat_results:
-        raise HTTPException(404, "요청 ID를 찾을 수 없습니다.")
-    
-    status_data = chat_results[request_id].copy() # 🆕 원본 데이터 보호를 위해 복사본 반환
-    
-    # 대기 중인 경우 실시간 순번 업데이트
-    if status_data["status"] == "waiting" and request_id in chat_pending_ids:
-        status_data["position"] = chat_pending_ids.index(request_id) + 1
-    else:
-        # 🆕 대기 중이 아니면 순속 정보 제거
-        status_data.pop("position", None)
-    
-    return status_data
+        return {
+            "session_id": request.session_id,
+            "answer": answer,
+            "sources": [],
+            "agent_log": response,
+            "evaluation_scores": evaluation_scores
+        }
+    except Exception as e:
+        print(f" [Agent] 에러: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, str(e))
 
 
 
@@ -1212,32 +1045,34 @@ def get_document_versions(doc_name: str):
         raise HTTPException(500, f"버전 조회 실패: {str(e)}")
 
 
-@app.get("/rag/document/{doc_name}/diff")
-def get_document_diff(doc_name: str, v1: str, v2: str):
-    """두 버전 간의 조항별 차이점 비교"""
+@app.get("/rag/document/{doc_name}/compare")
+def compare_versions(doc_name: str, v1: str, v2: str):
+    """두 버전 간의 조항 단위 차이 비교"""
     try:
         diffs = sql_store.get_clause_diff(doc_name, v1, v2)
-        if diffs and "error" in diffs[0]:
-            raise HTTPException(400, diffs[0]["error"])
+
+        # 에러가 있는지 확인
+        if diffs and isinstance(diffs[0], dict) and 'error' in diffs[0]:
+            raise HTTPException(400, diffs[0]['error'])
+
         return {
             "doc_name": doc_name,
             "v1": v1,
             "v2": v2,
             "diffs": diffs,
-            "count": len(diffs)
+            "total_changes": len(diffs)
         }
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(500, f"비교 실패: {str(e)}")
+        raise HTTPException(500, f"버전 비교 실패: {str(e)}")
 
 
 @app.get("/rag/changes")
 def get_changes(limit: int = 50):
     """최근 문서 변경 이력 조회"""
     try:
-        # SQLStore에 최근 변경 이력을 가져오는 메서드가 없으므로, 모든 문서를 가져와서 가공하거나
-        # 새로운 메서드를 추가해야 함. 여기서는 get_all_documents를 활용하여 최근 수정순으로 반환.
+        # SQLStore에서 모든 문서를 가져와서 최근 수정순으로 반환
         all_docs = sql_store.get_all_documents()
         changes = []
         for doc in all_docs[:limit]:
@@ -2096,12 +1931,105 @@ def evaluate_answer(request: EvaluationRequest):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 서버 실행
+# === Security Context ===
 # ═══════════════════════════════════════════════════════════════════════════
+from passlib.context import CryptContext
+from fastapi.security import OAuth2PasswordBearer
+from jose import JWTError, jwt
+from datetime import datetime, timedelta
+
+pwd_context = CryptContext(schemes=["pbkdf2_sha256", "bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login")
+
+# JWT 설정
+SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-this-in-production")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7일
+
+# === Auth Models ===
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+    user: Dict
+
+class TokenData(BaseModel):
+    username: Optional[str] = None
+
+class UserRegister(BaseModel):
+    username: str
+    password: str
+    name: str
+    email: str
+    rank: Optional[str] = None
+    dept: Optional[str] = None
+
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, v):
+        if not v:
+            return v
+        regex = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+        if not re.match(regex, v):
+            raise ValueError("올바른 이메일 형식이 아닙니다.")
+        return v
+
+class UserLogin(BaseModel):
+    username: str
+    password: str
+
+class UserSnippet(BaseModel):
+    username: str
+    name: str
+
+class PasswordReset(BaseModel):
+    user_id: int
+    new_password: str
+
+class FindUsernameRequest(BaseModel):
+    name: str
+    dept: Optional[str] = None
+
+# === Auth Helper Functions ===
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password: str) -> str:
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+async def get_current_user(token: str = Depends(oauth2_scheme)) -> Dict:
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+        token_data = TokenData(username=username)
+    except JWTError:
+        raise credentials_exception
+
+    user = sql_store.get_user_by_username(token_data.username)
+    if user is None:
+        raise credentials_exception
+    return user
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # === Auth Endpoints ===
+# ═══════════════════════════════════════════════════════════════════════════
 
 # 부서/직책 기본 목록
 DEFAULT_DEPARTMENTS = ["품질관리부", "품질보증부", "생산부", "연구개발부", "경영지원부", "영업부"]
@@ -2233,6 +2161,445 @@ async def reset_password_endpoint(req: PasswordReset):
     except Exception:
         raise HTTPException(status_code=500, detail="비밀번호 변경 실패")
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# OnlyOffice + S3 엔드포인트
+# ═══════════════════════════════════════════════════════════════════════════
+
+class OnlyOfficeConfigRequest(BaseModel):
+    doc_name: str
+    version: Optional[str] = None
+    user_name: str = "편집자"
+    mode: str = "view"
+
+
+@app.post("/rag/upload-docx")
+async def upload_docx_to_s3(
+    file: UploadFile = File(...),
+    doc_name: str = Form(...),
+    version: str = Form("1.0"),
+    collection: str = Form("documents"),
+):
+    """
+    DOCX 파일을 S3에 저장 후 RAG 파이프라인 실행
+
+    입력: file (DOCX), doc_name (문서 ID), version
+    동작:
+      1. S3에 저장 (documents/{doc_name}/v{version}/document.docx)
+      2. DOCX → 마크다운 변환
+      3. Weaviate + PostgreSQL + Neo4j 저장
+    """
+    start_time = time.time()
+
+    if not file.filename.lower().endswith('.docx'):
+        raise HTTPException(400, "DOCX 파일만 업로드 가능합니다.")
+
+    content = await file.read()
+
+    # 1. S3 저장
+    s3 = get_s3_store()
+    s3_key = s3.upload_docx(doc_name, version, content)
+    print(f"  S3 저장 완료: {s3_key}")
+
+    # 2. 파이프라인 실행
+    model_path = resolve_model_path("multilingual-e5-small")
+    embed_model = SentenceTransformer(model_path)
+    filename = f"{doc_name}_v{version}.docx"
+
+    result = process_document(
+        file_path=filename,
+        content=content,
+        doc_id=doc_name,
+        use_llm_metadata=False,
+        embed_model=embed_model,
+    )
+
+    if not result.get("success"):
+        raise HTTPException(400, f"문서 처리 실패: {result.get('errors')}")
+
+    chunks_data = result.get("chunks", [])
+
+    from dataclasses import dataclass
+
+    @dataclass
+    class _Chunk:
+        text: str
+        metadata: dict
+        index: int = 0
+
+    chunks = [_Chunk(text=c["text"], metadata=c["metadata"], index=c["index"]) for c in chunks_data]
+
+    # 3. Weaviate 저장
+    pipeline_version = "pdf-clause-v2.0"
+    texts = [c.text for c in chunks]
+    metadatas = [
+        {**c.metadata, "chunk_method": "article", "model": "multilingual-e5-small", "pipeline_version": pipeline_version}
+        for c in chunks
+    ]
+    vector_store.add_documents(
+        texts=texts, metadatas=metadatas, collection_name=collection, model_name=model_path
+    )
+
+    # 4. PostgreSQL 저장
+    from backend.document_pipeline import docx_to_markdown
+    markdown_text = docx_to_markdown(content)
+
+    doc_id_db = sql_store.save_document(
+        doc_name=doc_name,
+        content=markdown_text,
+        doc_type="docx",
+        version=version,
+    )
+    if doc_id_db and chunks:
+        batch_chunks = [
+            {"clause": c.metadata.get("clause_id"), "content": c.text, "metadata": c.metadata}
+            for c in chunks
+        ]
+        sql_store.save_chunks_batch(doc_id_db, batch_chunks)
+
+    # 5. Neo4j 저장
+    try:
+        graph = get_graph_store()
+        if graph.test_connection():
+            _upload_to_neo4j_from_pipeline(graph, result, filename)
+    except Exception as graph_err:
+        print(f"  Neo4j 저장 실패 (건너뜀): {graph_err}")
+
+    elapsed = round(time.time() - start_time, 2)
+    return {
+        "success": True,
+        "doc_name": doc_name,
+        "version": version,
+        "s3_key": s3_key,
+        "chunks": len(chunks),
+        "elapsed_seconds": elapsed,
+    }
+
+
+class UploadS3Request(BaseModel):
+    s3_key: str
+    doc_name: str
+    version: str = "1.0"
+
+
+# S3 / OnlyOffice 싱글톤 (필요 시 lazy 초기화)
+_s3_store = None
+
+def get_s3_store():
+    global _s3_store
+    if _s3_store is None:
+        from backend.s3_store import S3Store
+        _s3_store = S3Store()
+    return _s3_store
+
+
+@app.post("/onlyoffice/config")
+async def onlyoffice_config(request: OnlyOfficeConfigRequest):
+    """
+    OnlyOffice 에디터 설정 JSON 반환
+
+    입력: { doc_name, version(optional), user_name }
+    동작:
+      1. SQL에서 최신 버전 조회 (version 미지정 시)
+      2. S3 presigned URL 생성
+      3. OnlyOffice 설정 JSON 반환
+    """
+    try:
+        from backend.onlyoffice_service import create_editor_config, get_onlyoffice_server_url, BACKEND_URL
+
+        doc_name = request.doc_name
+
+        # 버전 결정: 사용자 지정 없으면 DB 최신 버전 사용
+        version = request.version
+        if not version:
+            versions_data = sql_store.get_document_versions(doc_name)
+            if not versions_data:
+                raise HTTPException(404, f"문서를 찾을 수 없습니다: {doc_name}")
+            version = versions_data[0].get('version', '1.0')
+
+        # 백엔드 내부 URL 사용 (S3 presigned URL 대신)
+        # OnlyOffice가 JWT 헤더를 붙여 요청 → 백엔드가 검증 후 S3에서 파일 서빙
+        file_url = f"{BACKEND_URL}/onlyoffice/document/{doc_name}/{version}"
+
+        # OnlyOffice 설정 생성
+        config = create_editor_config(
+            doc_id=doc_name,
+            version=version,
+            user_name=request.user_name,
+            file_url=file_url,
+            mode=request.mode,
+        )
+
+        return {
+            "config": config,
+            "doc_name": doc_name,
+            "version": version,
+            "onlyoffice_server_url": get_onlyoffice_server_url(),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, f"OnlyOffice 설정 생성 실패: {str(e)}")
+
+
+@app.get("/onlyoffice/document/{doc_name}/{version}")
+async def serve_docx_for_onlyoffice(doc_name: str, version: str):
+    """
+    OnlyOffice Document Server가 DOCX를 가져가는 내부 엔드포인트.
+    S3 presigned URL 대신 이 URL을 document.url로 사용:
+      - OnlyOffice가 JWT Authorization 헤더를 붙여도 S3와 충돌 없음
+      - 백엔드가 S3에서 파일을 가져와 OnlyOffice에 직접 서빙
+    """
+    try:
+        s3 = get_s3_store()
+        content = s3.download_docx(doc_name, version)
+        return Response(
+            content=content,
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            headers={"Content-Disposition": f'attachment; filename="{doc_name}_v{version}.docx"'},
+        )
+    except Exception as e:
+        raise HTTPException(404, f"문서를 찾을 수 없습니다: {doc_name} v{version} ({e})")
+
+
+@app.post("/onlyoffice/callback")
+async def onlyoffice_callback(request: Request):
+    """
+    OnlyOffice 콜백 처리
+
+    OnlyOffice가 저장 완료 시 호출.
+    status 2(저장 중) 또는 6(편집 완료) 시 DOCX를 S3에 새 버전으로 저장하고
+    RAG 파이프라인을 실행합니다.
+
+    반환: {"error": 0} (OnlyOffice 요구사항)
+    """
+    try:
+        callback_data = await request.json()
+        status = callback_data.get('status')
+        download_url = callback_data.get('url')
+        key = callback_data.get('key', '')
+
+        print(f"\n[OnlyOffice Callback] status={status}, key={key}")
+
+        # status 2 = 문서 저장 중, status 6 = 편집 완료(강제 저장)
+        if status not in (2, 6):
+            return {"error": 0}
+
+        if not download_url:
+            print("  콜백 URL 없음 - 건너뜀")
+            return {"error": 0}
+
+        # key 형식: {doc_id}_v{version}_{timestamp}
+        parts = key.split('_v')
+        doc_id = parts[0] if len(parts) > 1 else key
+        version_part = parts[1].rsplit('_', 1)[0] if len(parts) > 1 else '1.0'
+
+        # 새 버전 번호 결정 (현재 버전 + 0.1)
+        try:
+            current_v = float(version_part)
+            new_version = f"{current_v + 0.1:.1f}"
+        except ValueError:
+            new_version = version_part + "_edited"
+
+        print(f"  문서: {doc_id}, 현재버전: {version_part} → 새버전: {new_version}")
+
+        # 1. OnlyOffice 서버에서 편집된 DOCX 다운로드
+        from backend.onlyoffice_service import download_from_onlyoffice
+        docx_content = await download_from_onlyoffice(download_url)
+        print(f"  DOCX 다운로드 완료: {len(docx_content)} bytes")
+
+        # 2. S3에 새 버전으로 저장
+        s3 = get_s3_store()
+        s3_key = s3.upload_docx(doc_id, new_version, docx_content)
+        print(f"  S3 저장 완료: {s3_key}")
+
+        # 3. DOCX → 마크다운 변환
+        from backend.document_pipeline import docx_to_markdown
+        markdown_text = docx_to_markdown(docx_content)
+
+        # 4. RAG 파이프라인 실행 (process_document)
+        model_path = resolve_model_path("multilingual-e5-small")
+        embed_model = SentenceTransformer(model_path)
+
+        result = process_document(
+            file_path=f"{doc_id}_v{new_version}.docx",
+            content=docx_content,
+            doc_id=doc_id,
+            use_llm_metadata=False,
+            embed_model=embed_model,
+        )
+
+        if not result.get("success"):
+            print(f"  파이프라인 실패: {result.get('errors')}")
+            return {"error": 0}
+
+        chunks_data = result.get("chunks", [])
+
+        # 5. Weaviate 저장
+        from dataclasses import dataclass
+
+        @dataclass
+        class _Chunk:
+            text: str
+            metadata: dict
+            index: int = 0
+
+        chunks = [_Chunk(text=c["text"], metadata=c["metadata"], index=c["index"]) for c in chunks_data]
+        texts = [c.text for c in chunks]
+        metadatas = [
+            {**c.metadata, "chunk_method": "article", "model": "multilingual-e5-small", "pipeline_version": "pdf-clause-v2.0"}
+            for c in chunks
+        ]
+        vector_store.add_documents(
+            texts=texts, metadatas=metadatas, collection_name="documents", model_name=model_path
+        )
+
+        # 6. PostgreSQL 저장
+        doc_id_db = sql_store.save_document(
+            doc_name=doc_id,
+            content=markdown_text,
+            doc_type="docx",
+            version=new_version,
+        )
+        if doc_id_db and chunks:
+            batch_chunks = [
+                {"clause": c.metadata.get("clause_id"), "content": c.text, "metadata": c.metadata}
+                for c in chunks
+            ]
+            sql_store.save_chunks_batch(doc_id_db, batch_chunks)
+
+        # 7. Neo4j 저장
+        try:
+            graph = get_graph_store()
+            if graph.test_connection():
+                _upload_to_neo4j_from_pipeline(graph, result, f"{doc_id}_v{new_version}.docx")
+        except Exception as graph_err:
+            print(f"  Neo4j 저장 실패 (건너뜀): {graph_err}")
+
+        print(f"  [OnlyOffice Callback] 완료 - 새 버전 {new_version} 저장됨")
+        return {"error": 0}
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"  [OnlyOffice Callback] 오류: {e}")
+        # OnlyOffice는 error: 0이 아니면 재시도하므로 항상 0 반환
+        return {"error": 0}
+
+
+@app.post("/rag/upload-s3")
+async def upload_from_s3(request: UploadS3Request):
+    """
+    S3에 이미 있는 DOCX 파일을 RAG 파이프라인으로 처리
+
+    입력: { s3_key, doc_name, version }
+    동작:
+      1. S3에서 DOCX 다운로드
+      2. 기존 /rag/upload 파이프라인 실행
+    """
+    start_time = time.time()
+    try:
+        import boto3
+        import os
+
+        # S3에서 파일 다운로드
+        s3_client = boto3.client(
+            's3',
+            aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
+            aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
+            region_name=os.getenv('AWS_REGION', 'ap-northeast-2'),
+        )
+        bucket = os.getenv('S3_BUCKET_NAME')
+        response = s3_client.get_object(Bucket=bucket, Key=request.s3_key)
+        content = response['Body'].read()
+
+        filename = f"{request.doc_name}_v{request.version}.docx"
+        model_path = resolve_model_path("multilingual-e5-small")
+        embed_model = SentenceTransformer(model_path)
+
+        result = process_document(
+            file_path=filename,
+            content=content,
+            doc_id=request.doc_name,
+            use_llm_metadata=False,
+            embed_model=embed_model,
+        )
+
+        if not result.get("success"):
+            raise HTTPException(400, f"문서 처리 실패: {result.get('errors')}")
+
+        chunks_data = result.get("chunks", [])
+
+        from dataclasses import dataclass
+
+        @dataclass
+        class _Chunk:
+            text: str
+            metadata: dict
+            index: int = 0
+
+        chunks = [_Chunk(text=c["text"], metadata=c["metadata"], index=c["index"]) for c in chunks_data]
+
+        # Weaviate 저장
+        pipeline_version = "pdf-clause-v2.0"
+        texts = [c.text for c in chunks]
+        metadatas = [
+            {**c.metadata, "chunk_method": "article", "model": "multilingual-e5-small", "pipeline_version": pipeline_version}
+            for c in chunks
+        ]
+        vector_store.add_documents(
+            texts=texts, metadatas=metadatas, collection_name="documents", model_name=model_path
+        )
+
+        # PostgreSQL 저장
+        from backend.document_pipeline import docx_to_markdown
+        markdown_text = docx_to_markdown(content)
+
+        final_version = request.version or result.get("version", "1.0")
+        doc_id_db = sql_store.save_document(
+            doc_name=request.doc_name,
+            content=markdown_text,
+            doc_type="docx",
+            version=final_version,
+        )
+        if doc_id_db and chunks:
+            batch_chunks = [
+                {"clause": c.metadata.get("clause_id"), "content": c.text, "metadata": c.metadata}
+                for c in chunks
+            ]
+            sql_store.save_chunks_batch(doc_id_db, batch_chunks)
+
+        # Neo4j 저장
+        try:
+            graph = get_graph_store()
+            if graph.test_connection():
+                _upload_to_neo4j_from_pipeline(graph, result, filename)
+        except Exception as graph_err:
+            print(f"  Neo4j 저장 실패 (건너뜀): {graph_err}")
+
+        elapsed = round(time.time() - start_time, 2)
+        return {
+            "success": True,
+            "doc_name": request.doc_name,
+            "version": final_version,
+            "chunks": len(chunks),
+            "elapsed_seconds": elapsed,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, f"S3 업로드 처리 실패: {str(e)}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 서버 실행
+# ═══════════════════════════════════════════════════════════════════════════
 
 def main():
     print("[시스템] 초기화 중...")

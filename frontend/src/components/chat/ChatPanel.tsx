@@ -22,18 +22,6 @@ export default function ChatPanel({ isVisible, onDocumentSelect }: ChatPanelProp
   const [mentionTriggerPos, setMentionTriggerPos] = useState<number | null>(null)
   const [selectedDocs, setSelectedDocs] = useState<string[]>([])
 
-  // 🆕 알림 및 비동기 결과 관리
-  const [notifications, setNotifications] = useState<{ id: string, message: string }[]>([])
-  const activeIntervals = useRef<Record<string, any>>({}) // 🆕 메시지 ID별 인터벌 추적
-  const notifiedIds = useRef<Set<string>>(new Set()) // 🆕 알림 완료된 메시지 ID 추적
-
-  // 🆕 컴포넌트 언마운트 시 모든 인터벌 정리
-  useEffect(() => {
-    return () => {
-      Object.values(activeIntervals.current).forEach(clearInterval)
-    }
-  }, [])
-
   const [expandedSections, setExpandedSections] = useState<Set<string>>(new Set())
 
   const chatEndRef = useRef<HTMLDivElement>(null)
@@ -56,42 +44,27 @@ export default function ChatPanel({ isVisible, onDocumentSelect }: ChatPanelProp
   }, [])
 
   const sendMessage = async () => {
+    if (!inputMessage.trim() || isLoading) return
+
     const currentInput = inputMessage
     const currentDocs = [...selectedDocs]
+
     const formattedContent = currentDocs.length > 0
       ? `${currentDocs.map(d => `@${d}`).join(' ')} ${currentInput}`
       : currentInput
 
-    const assistantId = Math.random().toString(36).substr(2, 9)
+    const userMessage: ChatMessage = { role: 'user', content: formattedContent, timestamp: new Date() }
 
-    // 🆕 상태 업데이트 원자성 확보: 사용자 메시지와 어시스턴트 자리표시자를 한 번에 추가
-    setMessages(prev => [
-      ...prev,
-      { role: 'user', content: formattedContent, timestamp: new Date() },
-      {
-        id: assistantId,
-        role: 'assistant',
-        content: '',
-        timestamp: new Date(),
-        status: 'waiting',
-        isWaiting: true,
-        queuePosition: 0
-      }
-    ])
-
+    setMessages(prev => [...prev, userMessage])
     setInputMessage('')
     setIsLoading(true)
 
     const startTime = Date.now()
 
     try {
-      const token = localStorage.getItem('auth_token')
-      const headers: any = { 'Content-Type': 'application/json' }
-      if (token) headers['Authorization'] = `Bearer ${token}`
-
       const response = await fetch(`${API_URL}/chat`, {
         method: 'POST',
-        headers: headers,
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           message: currentDocs.length > 0
             ? `[Selected Documents: ${currentDocs.join(', ')}]\n${currentInput}`
@@ -101,137 +74,31 @@ export default function ChatPanel({ isVisible, onDocumentSelect }: ChatPanelProp
         }),
       })
 
+      const thinkingTime = Math.floor((Date.now() - startTime) / 1000)
+
       if (response.ok) {
         const data = await response.json()
-        const requestId = data.request_id
+        if (!sessionId) setSessionId(data.session_id)
 
-        // 🆕 초기 순번 업데이트
-        if (data.position) {
-          updateMessage(assistantId, { queuePosition: data.position, status: 'waiting' })
+        const assistantMessage: ChatMessage = {
+          role: 'assistant',
+          content: data.answer || '답변을 생성하지 못했습니다.',
+          timestamp: new Date(),
+          thoughtProcess: data.agent_log ? JSON.stringify(data.agent_log, null, 2) : 'Agent reasoning...',
+          thinkingTime,
+          evaluation_scores: data.evaluation_scores,
         }
-
-        // 🆕 폴링 시작 (메시지 ID 전달)
-        pollAnswer(requestId, startTime, assistantId)
+        setMessages(prev => [...prev, assistantMessage])
       } else {
         const error = await response.json()
-        updateMessage(assistantId, {
-          content: `오류가 발생했습니다: ${error.detail}`,
-          isWaiting: false,
-          status: 'error'
-        })
-        checkAllFinished()
+        setMessages(prev => [...prev, { role: 'assistant', content: `오류가 발생했습니다: ${error.detail}`, timestamp: new Date() }])
       }
     } catch (error) {
-      updateMessage(assistantId, {
-        content: `네트워크 오류: ${error}`,
-        isWaiting: false,
-        status: 'error'
-      })
-      checkAllFinished()
+      setMessages(prev => [...prev, { role: 'assistant', content: `네트워크 오류: ${error}`, timestamp: new Date() }])
     } finally {
+      setIsLoading(false)
       setSelectedDocs([])
     }
-  }
-
-  // 🆕 특정 ID의 메시지 업데이트 유틸리티
-  const updateMessage = (id: string, updates: Partial<ChatMessage>) => {
-    setMessages(prev => prev.map(m => m.id === id ? { ...m, ...updates } : m))
-  }
-
-  // 🆕 모든 비동기 작업 종료 여부 확인 및 isLoading 해제
-  const checkAllFinished = () => {
-    setMessages(prev => {
-      const stillWaiting = prev.some(m => m.isWaiting)
-      if (!stillWaiting) setIsLoading(false)
-      return prev
-    })
-  }
-
-  // 🆕 답변 상태 폴링 함수
-  const pollAnswer = (requestId: string, startTime: number, targetId: string) => {
-    // 🆕 이미 해당 메시지에 대해 폴링 중이라면 중복 실행 방지
-    if (activeIntervals.current[targetId]) return
-
-    let attempts = 0
-    const maxAttempts = 180 // 2초 * 180 = 360초 (6분으로 확장)
-    let lastPosition = -1
-
-    const intervalId = setInterval(async () => {
-      attempts++
-      activeIntervals.current[targetId] = intervalId // 🆕 확실히 할당
-      try {
-        const response = await fetch(`${API_URL}/chat/status/${requestId}`)
-        const data = await response.json()
-
-        if (data.status === 'completed') {
-          clearInterval(intervalId)
-          delete activeIntervals.current[targetId]
-
-          const thinkingTime = Math.floor((Date.now() - startTime) / 1000)
-          const result = data.result
-
-          if (!sessionId) setSessionId(result.session_id)
-
-          updateMessage(targetId, {
-            content: result.answer || '답변을 생성하지 못했습니다.',
-            timestamp: new Date(),
-            thoughtProcess: result.agent_log ? JSON.stringify(result.agent_log, null, 2) : 'Agent reasoning...',
-            thinkingTime,
-            evaluation_scores: result.evaluation_scores,
-            status: 'completed',
-            isWaiting: false
-          })
-
-          checkAllFinished()
-
-          // 알림 추가 (로컬 가드로 중복 방지)
-          if (!notifiedIds.current.has(targetId)) {
-            notifiedIds.current.add(targetId)
-            const notificationId = Math.random().toString(36).substr(2, 9)
-            setNotifications(prev => [...prev, { id: notificationId, message: '에이전트의 답변이 도착했습니다!' }])
-            setTimeout(() => {
-              setNotifications(prev => prev.filter(n => n.id !== notificationId))
-            }, 4000)
-          }
-
-        } else if (data.status === 'waiting') {
-          // 순번이 바뀌었을 때만 업데이트 (렌더링 최적화)
-          if (data.position !== lastPosition) {
-            lastPosition = data.position
-            updateMessage(targetId, {
-              status: 'waiting',
-              queuePosition: data.position || 1
-            })
-          }
-        } else if (data.status === 'processing') {
-          // 처리 중 상태 반영
-          updateMessage(targetId, {
-            status: 'processing',
-            queuePosition: 0
-          })
-        } else if (data.status === 'error') {
-          clearInterval(intervalId)
-          delete activeIntervals.current[targetId]
-          updateMessage(targetId, {
-            content: `처리에 실패했습니다: ${data.error}`,
-            status: 'error',
-            isWaiting: false
-          })
-          checkAllFinished()
-        } else if (attempts >= maxAttempts) {
-          clearInterval(intervalId)
-          delete activeIntervals.current[targetId]
-          updateMessage(targetId, {
-            content: '답변 생성 시간이 초과되었습니다.',
-            status: 'error',
-            isWaiting: false
-          })
-          checkAllFinished()
-        }
-      } catch (error) {
-        console.error('Polling error:', error)
-      }
-    }, 2000)
   }
 
   const handleKeyPress = (e: React.KeyboardEvent) => {
@@ -352,22 +219,6 @@ export default function ChatPanel({ isVisible, onDocumentSelect }: ChatPanelProp
           onRemoveDoc={removeSelectedDoc}
         />
       </div>
-
-      {/* 🆕 알림 Toast UI */}
-      <div className="fixed bottom-24 right-6 flex flex-col gap-2 z-[3000]">
-        {notifications.map(n => (
-          <div key={n.id} className="bg-accent-blue text-white px-4 py-3 rounded-lg shadow-2xl flex items-center gap-3 animate-slide-in-right">
-            <div className="w-2 h-2 bg-white rounded-full animate-pulse" />
-            <span className="text-[13px] font-medium">{n.message}</span>
-            <button
-              onClick={() => setNotifications(prev => prev.filter(notif => notif.id !== n.id))}
-              className="ml-2 hover:opacity-70"
-            >
-              ×
-            </button>
-          </div>
-        ))}
-      </div>
     </aside>
-  );
+  )
 }
