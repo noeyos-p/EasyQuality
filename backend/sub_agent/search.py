@@ -326,6 +326,7 @@ class SearchState(TypedDict):
     query: str
     model: str
     final_answer: str
+    detected_doc_id: Optional[str] # v8.5 추가
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 노드 및 도구 설정
@@ -342,6 +343,7 @@ def call_model_node(state: SearchState):
 
     [ROLE]
     Find and analyze information from the document repository to answer user questions accurately.
+    {f"**TARGET DOCUMENT DETECTED**: {state.get('detected_doc_id')} - Prioritize searching this document." if state.get('detected_doc_id') else ""}
 
     [STRICT GOVERNANCE: NO HALLUCINATION]
     - **ZERO INFERENCE**: DO NOT include any information, numbers, or procedures that are NOT explicitly present in the `[DATA_SOURCE]`.
@@ -358,9 +360,13 @@ def call_model_node(state: SearchState):
        - **Keyword Extraction**: Extract ONLY nouns/terms that actually appear in the question for `keywords`. DO NOT infer or add words.
          Example: "작업지침서가 뭐야" → keywords: ["작업지침서"] (✓), keywords: ["작업지침서", "정의", "목적"] (✗)
 
-    3. **Validation & Filtering (CRITICAL)**:
-       - IGNORE results that only contain headers without content (e.g., '3. 정의') or are irrelevant to the question.
-       - Only include information that you actually use in your answer.
+    [STRICT NAMING RULE - MANDATORY]
+    - **NEVER** use generic terms like "이 문서" (this document), "본 규정" (this regulation), "해당 문서" (the document), or "문서"(document) when referring to an SOP.
+    - **NEVER** start an answer or a sentence with generic phrases like "문서의 목적은..." or "이 문서는...".
+    - **ALWAYS** use the full Document ID (e.g., "EQ-SOP-00001") as the subject.
+    - **Incorrect**: "문서의 목적은 다음과 같습니다." / "이 문서는 제품표준서를 관리합니다."
+    - **Correct**: "EQ-SOP-00001의 목적은 다음과 같습니다." / "EQ-SOP-00001은 제품표준서를 관리합니다."
+    - If multiple documents are retrieved, specify each ID clearly: "EQ-SOP-00001은 A를 수행하며, EQ-SOP-00004는 B를 수행합니다."
 
     4. **Answer Generation**: Write a natural **plain text** answer in Korean based on verified information.
        - **🚨 CRITICAL REQUIREMENT 🚨**: You MUST add [USE: ...] tags. Without tags, your answer will FAIL validation.
@@ -669,11 +675,20 @@ def retrieval_agent_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
     print(f" [Deep Search] 정밀 검색 가동: {state['query']}")
 
-    # 디버깅: state 확인
+    # v8.5: 질문 텍스트에서 SOP ID 자동 감지 (정규식 사용)
+    # 예: "EQ-SOP-00001 목적이 뭐야?" -> target_doc_id="EQ-SOP-00001"
+    auto_doc_id = None
+    sop_pattern = r'(EQ-(?:SOP|WI|FRM)-\d+)'
+    match = re.search(sop_pattern, state['query'], re.IGNORECASE)
+    if match:
+        auto_doc_id = match.group(1).upper()
+        print(f"    [Deep Search] 질문에서 문서 ID 감지: {auto_doc_id}")
+
+    # 모델 정보 확인
     worker_model = state.get("worker_model")
     model_name = state.get("model_name")
     final_model = worker_model or model_name or "gpt-4o-mini"
-    print(f"[DEBUG retrieval] worker_model={worker_model}, model_name={model_name}, final={final_model}")
+    print(f"[DEBUG retrieval] model={final_model}")
 
     initial_state = {
         "messages": [{"role": "user", "content": state["query"]}],
@@ -681,6 +696,14 @@ def retrieval_agent_node(state: Dict[str, Any]) -> Dict[str, Any]:
         "model": final_model,
         "final_answer": ""
     }
+
+    # 만약 오케스트레이터가 넘겨준 타겟이 없고 본문에서 감지되었다면 주입
+    # (이미 있으면 그대로 유지)
+    if auto_doc_id and not state.get("target_doc_id"):
+        # 초기 메시지에 힌트를 주어 LLM이 tool 호출 시 해당 ID를 사용하도록 유도하거나, 
+        # 직접 SearchState에 반영 (여기서는 search_documents_internal 호출 시 반영되도록 model_node 프롬프트 보강 고려 가능)
+        # 하지만 더 확실한 방법은 call_model_node의 프롬프트에 감지된 ID를 명시하는 것임
+        initial_state["detected_doc_id"] = auto_doc_id
 
     # 내부 도구 호출 루프 실행 (재귀 한도 내에서 자율 검색)
     result = _deep_search_app.invoke(initial_state, config={"recursion_limit": 15})
