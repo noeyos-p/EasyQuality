@@ -21,6 +21,7 @@ def answer_agent_node(state: AgentState):
 
     # "[검색 에이전트 조사 최종 보고]" 헤더 제거
     search_report = re.sub(r'###\s*\[검색 에이전트 조사 최종 보고\]\s*', '', search_report)
+    search_report = re.sub(r'###\s*\[대화 에이전트 보고\]\s*', '', search_report)
 
     # [DONE] 태그 제거 (나중에 [참고 문서] 뒤에 추가)
     search_report = re.sub(r'\s*\[DONE\]\s*$', '', search_report, flags=re.MULTILINE).strip()

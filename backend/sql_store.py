@@ -24,7 +24,15 @@ class SQLStore:
         self.config = config or DB_CONFIG
         
     def _get_connection(self):
-        return psycopg2.connect(**self.config)
+        conn = psycopg2.connect(**self.config)
+        try:
+            from pgvector.psycopg2 import register_vector
+            register_vector(conn)
+        except ImportError:
+            pass # pgvector 라이브러리가 없거나, DB에 vector 확장이 없는 경우 등
+        except Exception:
+            pass
+        return conn
 
     def init_db(self):
         """스키마 초기화: 문서 기반 통합 관리 테이블 생성"""
@@ -525,9 +533,21 @@ class SQLStore:
             return None
 
     # Memory 테이블 관련 메서드
+<<<<<<< Updated upstream
     def save_memory(self, question: str, answer: str, users_id: int = None) -> Optional[int]:
         """대화 기록 저장"""
         insert_query = "INSERT INTO memory (question, answer, users_id) VALUES (%s, %s, %s) RETURNING id;"
+=======
+    def save_memory(self, question: str, answer: str, users_id: int = None, embedding: List[float] = None, session_id: str = "default") -> Optional[int]:
+        """대화 기록 저장"""
+        if embedding:
+            insert_query = "INSERT INTO memory (question, answer, users_id, embedding, session_id) VALUES (%s, %s, %s, %s, %s) RETURNING id;"
+            params = (question, answer, users_id, embedding, session_id)
+        else:
+            insert_query = "INSERT INTO memory (question, answer, users_id, session_id) VALUES (%s, %s, %s, %s) RETURNING id;"
+            params = (question, answer, users_id, session_id)
+            
+>>>>>>> Stashed changes
         try:
             with self._get_connection() as conn:
                 with conn.cursor() as cur:
@@ -556,6 +576,40 @@ class SQLStore:
         except Exception:
             return []
 
+<<<<<<< Updated upstream
+=======
+    def get_conversation_history(self, user_id: int, limit: int = 10) -> List[Dict]:
+        """대화 기록 조회 (Agent용 포맷)"""
+        memories = self.get_memory_by_user(user_id, limit)
+        history = []
+        # 최신순으로 가져왔으므로 역순으로 정렬하여 시간순으로 배치
+        for mem in reversed(memories):
+            history.append({"role": "user", "content": mem["question"]})
+            history.append({"role": "assistant", "content": mem["answer"]})
+        return history
+
+    def search_memory_similar(self, users_id: int, query_embedding: List[float], limit: int = 3) -> List[Dict]:
+        """
+        pgvector 기반 유사도 기억 검색
+        - embedding <-> query_embedding (거리 기준 오름차순)
+        """
+        sql = """
+            SELECT id, question, answer, created_at
+            FROM memory
+            WHERE users_id = %s AND embedding IS NOT NULL
+            ORDER BY embedding <-> %s
+            LIMIT %s
+        """
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute(sql, (users_id, str(query_embedding), limit))
+                    return cur.fetchall()
+        except Exception as e:
+            print(f" [SQLStore] 유사 기억 검색 실패: {e}")
+            return []
+
+>>>>>>> Stashed changes
     # ═══════════════════════════════════════════════════════════════════════════
     # 마이그레이션 함수
     # ═══════════════════════════════════════════════════════════════════════════

@@ -9,6 +9,7 @@ python-multipart
 
 # === 데이터베이스 ===
 psycopg2-binary
+pgvector
 neo4j
 
 # === ML/임베딩 ===

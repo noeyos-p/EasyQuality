@@ -364,12 +364,33 @@ def orchestrator_node(state: AgentState):
     1. retrieval: 규정 검색, 정보 조회. (어떤 문서가 있는지 모를 때 먼저 사용)
     2. comparison: 두 문서의 버전 차이 비교 또는 버전 히스토리(목록) 조회.
     3. graph: **참조/인용 관계(Reference), 상위/하위 규정 관계 확인**. "참조 목록 알려줘", "어떤 규정을 따르나?", "영향 분석해줘" 등의 질문은 반드시 이 에이전트가 처리해야 합니다.
+    4. chat: **일반 대화 및 메타 인지(History) 질문**. 
+       - "안녕", "고마워" 같은 인사
+       - "**내 질문이 뭐였지?**", "**방금 뭐라고 했어?**", "**이전 답변 요약해줘**" 등 **대화 맥락(History)**을 묻는 질문
+       - 문서를 검색할 필요가 없는 개인적인 질문이나 농담
+
+    [라우팅 규칙 - 우선순위가 높은 순서대로 적용]
+    1. **Comparison (비교/이력)**: 특정 문서의 버전, 변경 사항, 이력, 수정 내역을 묻는 경우
+       - 키워드: "버전", "이력", "History", "변경", "수정", "차이", "비교", "뭐가 달라졌어?", "업데이트 내역"
+       - 문서 ID가 식별되지 않았다면 먼저 `retrieval`로 문서를 찾으세요.
+
+    2. **Graph (관계/참조)**: 문서 간의 연결 관계, 상위/하위 구조, 영향도를 묻는 경우
+       - 키워드: "참조 목록", "Reference", "연결된 문서", "상위문서", "하위문서", "근거 문서", "영향 분석", "어떤 규정을 따라야 해?", "관련된 문서 다 찾아줘"
+       - `retrieval`로 본문을 찾는 것이 아닙니다. 문서는 이미 존재한다고 가정하고 관계를 찾으세요.
+
+    3. **Chat (대화/기억/메타인지)**: 문서 내용이 아닌, **나(사용자)와 너(AI)**의 대화에 대한 질문
+       - **사용자의 과거 발언 확인**: "방금 내가 무슨 말 했어?", "내 질문 다시 말해봐", "아까 질문했던거 뭐야?"
+       - **AI의 과거 답변 확인**: "방금 니가 뭐라고 했어?", "이전 답변 요약해줘", "아까 답변 다시 보여줘"
+       - **일상 대화**: "안녕", "고마워", "너 누구야?", "뭐 할 줄 알아?"
+       - ⚠️ 주의: "SOP-001의 목적이 뭐야?"는 문서 질문이므로 `chat`이 아니라 `retrieval`로 보내야 합니다. 오직 **대화 맥락**을 물을 때만 `chat`입니다.
+
+    4. **Retrieval (검색/정보조회)**: 위 3가지에 해당하지 않는 모든 일반적인 규정/지식 질문
+       - "SOP-001 목적 알려줘", "일탈 발생 시 처리 절차는?", "품질부서 책임이 뭐야?"
+       - 특정 문서를 지칭하지 않더라도 내용을 물어보면 이 에이전트입니다.
     
-    [라우팅 규칙]
-    - 사용자가 "**버전**", "**이력**", "**History**", "**변경**", "**수정**", "**차이**", "**비교**" 등의 단어를 사용하여 특정 문서에 대해 질문하면 **무조건 `comparison`**을 호출하세요. (예: "SOP-001 버전 알려줘", "SOP-001 바뀐거 뭐야?", "1.0과 2.0 차이가 뭐야?")
-    - 사용자가 "**참조 목록**", "**Reference**", "**연결된 문서**", "**상위문서**", "**하위문서**", "**근거 문서**", "**영향 분석**" 등을 물어보면 **무조건 `graph`**를 호출하세요. `retrieval`로 본문에서 찾으려 하지 마세요.
-    - 이전 대화에서 이미 특정 문서(SOP ID)가 식별되었다면, 그 ID를 바탕으로 전문 에이전트(graph, comparison)를 즉시 호출하세요.
-    - 만약 서브 에이전트가 "문서 ID를 찾지 못했다"고 보고한다면, `retrieval`을 통해 먼저 문서 ID를 찾은 후 다시 해당 에이전트를 부르세요.
+    [예외 처리 가이드]
+    - 서브 에이전트가 "문서 ID를 찾지 못했다"고 보고하면, 즉시 `retrieval`을 호출하여 문서 ID를 먼저 찾으세요.
+    - `retrieval` 결과가 너무 많으면 사용자에게 "어떤 문서에 대해 궁금하신가요?"라고 되묻는 대신, 가장 관련성 높은 문서를 스스로 선택하여 심층 검색(`deep search`)을 진행하세요.
     
     [중요 종료 조건]
     - 서브 에이전트가 답변 마지막에 `[DONE]`을 포함했거나, 답변 내용이 질문에 충분히 대답하고 있다면 **절대 다시 질문하거나 요약하지 말고 즉시 `finish`를 선택**하세요.
@@ -402,6 +423,17 @@ def orchestrator_node(state: AgentState):
     
     위 보고서 내용을 바탕으로 다음 단계를 결정하세요. 만약 충분한 정보가 수집되었다면 'finish'를 선택하세요."""
 
+    # [Guardrail] 메타 인지 질문 강제 라우팅 (LLM 실수 방지)
+    # "방금", "이전", "뭐라고", "내 질문" 등의 키워드가 있고, 아직 chat 에이전트를 부르지 않았다면
+    last_user_msg = messages[-1]["content"] if messages else ""
+    meta_keywords = ["방금", "뭐라고", "이전 질문", "내 질문", "무슨 말", "무슨 질문", "직전", "처음 질문", "첫 질문", "마지막 질문", "아까 질문"]
+    is_meta_query = any(k in last_user_msg for k in meta_keywords)
+    
+    # 이미 chat을 다녀왔거나 루프 중이라면 무시
+    if is_meta_query and "chat" not in agent_calls and loop_count == 0:
+        print(f" [Guardrail] 메타 질문 감지 -> 'chat' 강제 라우팅 ('{last_user_msg}')")
+        return {"next_agent": "chat", "loop_count": loop_count + 1, "agent_calls": agent_calls}
+
     try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -423,7 +455,7 @@ def orchestrator_node(state: AgentState):
         print(f"[DEBUG Orchestrator] next_agent 추출: {next_agent}")
 
         # 검증: 허용된 값만 통과 (state와 정확히 일치)
-        ALLOWED_AGENTS = {"retrieval", "graph", "comparison", "answer"}
+        ALLOWED_AGENTS = {"retrieval", "graph", "comparison", "answer", "chat"}
         if next_agent not in ALLOWED_AGENTS:
             print(f"🔴 잘못된 next_agent '{next_agent}' 감지, answer로 변경")
             next_agent = "answer"
@@ -431,6 +463,10 @@ def orchestrator_node(state: AgentState):
             print(f"✅ next_agent '{next_agent}' 검증 통과")
 
         return {"next_agent": next_agent, "loop_count": loop_count + 1, "agent_calls": agent_calls}
+
+    except Exception as e:
+        print(f"Orchestrator Error: {e}")
+        return {"next_agent": "answer", "final_answer": "오류가 발생했습니다.", "loop_count": loop_count + 1, "agent_calls": agent_calls}
 
     except Exception as e:
         print(f"Orchestrator Error: {e}")
@@ -447,6 +483,7 @@ def create_workflow():
         from backend.sub_agent.graph import graph_agent_node as node_graph
         from backend.sub_agent.answer import answer_agent_node as node_answer
         from backend.sub_agent.compare import comparison_agent_node as node_comparison
+        from backend.sub_agent.chat import chat_agent_node as node_chat
     except ImportError as e:
         error_msg = str(e)
         print(f" 서브 에이전트 로드 실패: {error_msg}")
@@ -456,6 +493,7 @@ def create_workflow():
         node_comparison = error_node
         node_graph = error_node
         node_answer = error_node
+        node_chat = error_node
 
     workflow = StateGraph(AgentState)
 
@@ -465,6 +503,7 @@ def create_workflow():
     workflow.add_node("comparison", node_comparison)
     workflow.add_node("graph", node_graph)
     workflow.add_node("answer", node_answer)
+    workflow.add_node("chat", node_chat)
     
     # Edges
     workflow.add_edge(START, "orchestrator")
@@ -481,6 +520,7 @@ def create_workflow():
             "comparison": "comparison",
             "graph": "graph",
             "answer": "answer",
+            "chat": "chat",
             "end": END
         }
     )
@@ -489,6 +529,7 @@ def create_workflow():
     workflow.add_edge("retrieval", "orchestrator")
     workflow.add_edge("comparison", "orchestrator")
     workflow.add_edge("graph", "orchestrator")
+    workflow.add_edge("chat", "orchestrator")
     
     # 답변 에이전트가 생성한 답변은 최종 답변으로 종료
     workflow.add_edge("answer", END)

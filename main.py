@@ -36,6 +36,7 @@ sql_store = SQLStore()
 
 from sentence_transformers import SentenceTransformer
 from backend import vector_store
+from backend.vector_store import embed_text
 # from backend.prompt import build_rag_prompt, build_chunk_prompt (제거됨)
 from backend.llm import (
     get_llm_response,
@@ -859,6 +860,7 @@ def chat(request: ChatRequest):
         try:
             from backend.evaluation import AgentEvaluator
 
+<<<<<<< Updated upstream
             # 평가 생략 조건
             if len(answer) < 20:
                 print("평가 생략: 답변이 너무 짧음")
@@ -882,6 +884,77 @@ def chat(request: ChatRequest):
                     context=context,
                     metrics=["faithfulness", "groundness", "relevancy", "correctness"]
                 )
+=======
+            # Agent 실행 (이벤트 루프 차단을 방지하기 위해 별도 스레드에서 실행)
+            from backend.agent import run_agent, init_agent_tools
+            init_agent_tools(vector_store, get_graph_store(), sql_store)
+            
+            # 🧠 롱텀 메모리: 이전 대화 기록 및 유사 기억 조회
+            chat_history = []
+            if user_id:
+                try:
+                    # 1. 최근 대화 (History)
+                    chat_history = sql_store.get_conversation_history(user_id, limit=6)
+                    
+                    # 2. 관련 기억 (Semantic Memory)
+                    # 질문 임베딩 생성 (e5-small)
+                    query_embedding = embed_text(request.message)
+                    semantic_memories = sql_store.search_memory_similar(user_id, query_embedding, limit=3)
+                    
+                    if semantic_memories:
+                        memory_block = "\n".join([f"- Q: {m['question']}\n  A: {m['answer']}" for m in semantic_memories])
+                        print(f"  🧠 [Memory] 관련 기억 {len(semantic_memories)}건 발견")
+                        # 시스템 메시지로 주입 (가장 앞에 배치)
+                        chat_history = [{"role": "system", "content": f"[관련 과거 기억]\n{memory_block}"}] + chat_history
+                        
+                    print(f"  🧠 [Memory] 사용자 {user_id}의 컨텍스트 로드 완료")
+                except Exception as e:
+                    print(f"  ⚠️ [Memory] 조회 실패: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+            response = await asyncio.to_thread(
+                run_agent,
+                query=request.message,
+                session_id=request.session_id or str(uuid.uuid4()),
+                model_name=request.llm_model or "gpt-4o-mini",
+                chat_history=chat_history  # 히스토리 전달 (유사 기억 포함)
+            )
+            
+            answer = response.get("answer")
+            
+            # 🧠 롱텀 메모리: 새로운 대화 저장 (임베딩 + 요약)
+            if user_id and answer:
+                try:
+                     # 1. 질문 임베딩 생성 (재사용)
+                    if 'query_embedding' not in locals():
+                        query_embedding = embed_text(request.message)
+                    
+                    summarized_answer = answer
+                    # 2. 기억 요약 (토큰 절약 및 품질 향상) - 선택적
+                    if len(answer) > 200:
+                        summary_prompt = f"다음 Q&A를 나중을 위해 핵심만 1~2줄로 요약해줘.\nQ: {request.message}\nA: {answer}\n\n요약 (존댓말):"
+                        try:
+                            summarized = get_llm_response(
+                                prompt=summary_prompt,
+                                llm_model="gpt-4o-mini",
+                                llm_backend="openai",
+                                max_tokens=150,
+                                temperature=0.3
+                            )
+                            # "요약:" 같은 접두어 제거
+                            summarized_answer = summarized.replace("요약:", "").strip()
+                        except:
+                            summarized_answer = answer[:500] # 실패 시 원본 사용
+
+                    # 3. 저장
+                    sql_store.save_memory(request.message, summarized_answer, user_id, embedding=query_embedding, session_id=request.session_id or "default")
+                    print(f"  💾 [Memory] 대화 요약 저장 완료 (길이: {len(summarized_answer)})")
+                except Exception as e:
+                    print(f"  ⚠️ [Memory] 저장 실패: {e}")
+                    import traceback
+                    traceback.print_exc()
+>>>>>>> Stashed changes
 
                 # 로그 출력
                 if evaluation_scores:
