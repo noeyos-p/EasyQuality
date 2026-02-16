@@ -57,18 +57,21 @@ def graph_agent_node(state: AgentState):
 
     # 1. 의도 및 엔티티 추출 (LangChain ChatOpenAI 사용 - LangSmith 자동 추적)
     messages = state.get("messages", [])
-    extraction_prompt = f"""사용자의 질문과 대화 이력을 분석하여 분석 대상이 되는 SOP ID와 질문의 의도를 추출하세요.
-    - 질문: {query}
+    extraction_prompt = f"""Extract the target SOP ID and intent from the user question and conversation history.
+Question: {query}
 
-    [의도 분류]
-    - impact_analysis: 특정 문서를 변경했을 때 영향을 받는 하위 문서나 관련 절차를 찾고자 할 때
-    - dependency_analysis: 특정 문서가 작동하기 위해 참조해야 하는 상위 규정이나 근거를 찾고자 할 때
-    - relationship_check: 두 문서 사이의 연결 고리를 확인하고자 할 때
-    - general_info: 단순히 특정 문서의 참조 목록을 보고 싶어할 때
+## Intent Classification
 
-    반드시 JSON 형식으로만 답변하세요.
-    
-    예: {{"doc_id": "EQ-SOP-001", "intent": "impact_analysis", "reason": "이전 대화에서 찾은 SOP-001의 영향 분석"}}"""
+| Intent | Condition | Example |
+|--------|-----------|---------|
+| `impact_analysis` | Explore downstream documents/procedures affected when a document is changed | "If I change this, what gets affected?" |
+| `dependency_analysis` | Explore upstream regulations/basis that a document references | "What is the basis regulation for this document?" |
+| `relationship_check` | Check the connection between two documents | "What is the relationship between SOP-001 and SOP-004?" |
+| `general_info` | Simple lookup of a document's reference list | "Show me the reference list" |
+
+## Output (JSON only, no other text)
+
+{{"doc_id": "EQ-SOP-001", "intent": "impact_analysis", "reason": "One-line justification"}}"""
 
     try:
         # LangChain ChatOpenAI 사용 (JSON 응답)

@@ -350,62 +350,40 @@ def orchestrator_node(state: AgentState):
     
     messages = state["messages"]
     
-    system_prompt = """당신은 GMP 규정 시스템의 메인 오케스트레이터(Manager)입니다.
-    사용자의 질문을 해결하기 위해 하위 전문가 에이전트들을 지휘하고, 그들의 보고를 검증하는 역할을 수행합니다.
-    
-    [작업 흐름]
-    1. **History 분석**: 이전 대화 내용(History)을 보고, 이미 수행된 에이전트의 보고가 있는지 확인하세요.
+    system_prompt = """You are the orchestrator of the GMP regulatory system.
+You direct sub-agents to resolve user questions and verify reported results.
 
-    2. **판단(Judgement)**: 
-       - 보고 내용이 충분하다면 -> 'finish'를 선택하여 서브 에이전트의 답변을 그대로 확정하세요. (오케스트레이터가 직접 답변을 재작성하거나 요약하지 않습니다)
-       - 보고 내용이 부족하거나 오류가 있다면 -> 다른 에이전트를 호출하거나, 검색 조건을 바꿔서 다시 시도하게 하세요.
-    
-    [에이전트 목록 및 라우팅 가이드]
-    1. retrieval: 규정 검색, 정보 조회. (어떤 문서가 있는지 모를 때 먼저 사용)
-    2. comparison: 두 문서의 버전 차이 비교 또는 버전 히스토리(목록) 조회.
-    3. graph: **참조/인용 관계(Reference), 상위/하위 규정 관계 확인**. "참조 목록 알려줘", "어떤 규정을 따르나?", "영향 분석해줘" 등의 질문은 반드시 이 에이전트가 처리해야 합니다.
-    4. chat: **일반 대화 및 메타 인지(History) 질문**. 
-       - "안녕", "고마워" 같은 인사
-       - "**내 질문이 뭐였지?**", "**방금 뭐라고 했어?**", "**이전 답변 요약해줘**" 등 **대화 맥락(History)**을 묻는 질문
-       - 문서를 검색할 필요가 없는 개인적인 질문이나 농담
+## Routing (top-down, first match applies)
 
-    [라우팅 규칙 - 우선순위가 높은 순서대로 적용]
-    1. **Comparison (비교/이력)**: 특정 문서의 버전, 변경 사항, 이력, 수정 내역을 묻는 경우
-       - 키워드: "버전", "이력", "History", "변경", "수정", "차이", "비교", "뭐가 달라졌어?", "업데이트 내역"
-       - 문서 ID가 식별되지 않았다면 먼저 `retrieval`로 문서를 찾으세요.
+| Priority | Agent | Trigger Condition | Example |
+|----------|-------|-------------------|---------|
+| 1 | `comparison` | Questions about versions, changes, history, differences, or comparisons | "Show me the change history of SOP-001", "What changed?" |
+| 2 | `graph` | References, citations, parent/child relationships, impact analysis | "Show me the reference list", "Find related regulations" |
+| 3 | `chat` | Conversation context (History) questions or casual conversation | "What did I ask earlier?", "Hello", "Thanks" |
+| 4 | `retrieval` | All regulation/knowledge questions not matching the above three | "What is the procedure when a deviation occurs?" |
 
-    2. **Graph (관계/참조)**: 문서 간의 연결 관계, 상위/하위 구조, 영향도를 묻는 경우
-       - 키워드: "참조 목록", "Reference", "연결된 문서", "상위문서", "하위문서", "근거 문서", "영향 분석", "어떤 규정을 따라야 해?", "관련된 문서 다 찾아줘"
-       - `retrieval`로 본문을 찾는 것이 아닙니다. 문서는 이미 존재한다고 가정하고 관계를 찾으세요.
+> Note: `chat` is used only when asking about **conversation context**. "What is the purpose of SOP-001?" goes to `retrieval`.
 
-    3. **Chat (대화/기억/메타인지)**: 문서 내용이 아닌, **나(사용자)와 너(AI)**의 대화에 대한 질문
-       - **사용자의 과거 발언 확인**: "방금 내가 무슨 말 했어?", "내 질문 다시 말해봐", "아까 질문했던거 뭐야?"
-       - **AI의 과거 답변 확인**: "방금 니가 뭐라고 했어?", "이전 답변 요약해줘", "아까 답변 다시 보여줘"
-       - **일상 대화**: "안녕", "고마워", "너 누구야?", "뭐 할 줄 알아?"
-       - ⚠️ 주의: "SOP-001의 목적이 뭐야?"는 문서 질문이므로 `chat`이 아니라 `retrieval`로 보내야 합니다. 오직 **대화 맥락**을 물을 때만 `chat`입니다.
+## Workflow
 
-    4. **Retrieval (검색/정보조회)**: 위 3가지에 해당하지 않는 모든 일반적인 규정/지식 질문
-       - "SOP-001 목적 알려줘", "일탈 발생 시 처리 절차는?", "품질부서 책임이 뭐야?"
-       - 특정 문서를 지칭하지 않더라도 내용을 물어보면 이 에이전트입니다.
-    
-    [예외 처리 가이드]
-    - 서브 에이전트가 "문서 ID를 찾지 못했다"고 보고하면, 즉시 `retrieval`을 호출하여 문서 ID를 먼저 찾으세요.
-    - `retrieval` 결과가 너무 많으면 사용자에게 "어떤 문서에 대해 궁금하신가요?"라고 되묻는 대신, 가장 관련성 높은 문서를 스스로 선택하여 심층 검색(`deep search`)을 진행하세요.
-    
-    [중요 종료 조건]
-    - 서브 에이전트가 답변 마지막에 `[DONE]`을 포함했거나, 답변 내용이 질문에 충분히 대답하고 있다면 **절대 다시 질문하거나 요약하지 말고 즉시 `finish`를 선택**하세요.
-    - 이미 보고된 내용을 다듬기 위해 다른 에이전트를 호출하지 마세요.
-    
-    [출력 형식]
-    JSON 형식으로 'next_action' (agent 이름 또는 'finish')과 'reason'을 반환하세요.
-    - **중요(Termination)**: 서브 에이전트의 보고 내용에 이미 답변에 필요한 충분한 정보(예: 검색된 문단, 시각화 보고서, 요약 등)가 있다면 즉시 'finish'를 선택하세요.
-    - **루프 방지(Loop Prevention)**: 
-        1. 동일한 서브 에이전트({next_action})를 같은 목적({reason})으로 3회 이상 반복 호출하지 마세요. 
-        2. 만약 `retrieval` 에이전트가 "검색 결과 없음"을 보고했다면, 똑같은 검색어로는 다시 호출하지 마세요. 검색어를 바꾸거나 실패를 인정하고 'finish'하세요.
-        3. 이미 답변할 근거가 생겼음에도 불구하고 서브 에이전트를 계속 부르는 것은 금지됩니다.
-    
-    예: {"next_action": "retrieval", "reason": "규정 검색 결과가 부족하여 재검색 필요"}
-    """
+1. Check History for any previously completed agent reports.
+2. **If the report is sufficient** -> Proceed to `finish` immediately (confirm the sub-agent answer as-is; do not rewrite or summarize).
+3. **If the report is insufficient** -> Call the appropriate agent.
+
+## Core Rules
+
+- **Immediate termination**: If the sub-agent answer contains `[DONE]` or sufficiently addresses the question, do not make any additional calls; proceed to `finish`.
+- **When document ID is unconfirmed**: Before calling `comparison` or `graph`, first obtain the document ID via `retrieval`.
+- **When results are excessive**: Do not ask the user for clarification; select the most relevant document and proceed.
+- **Loop prevention**:
+  - Do not repeat the same agent for the same purpose **more than 3 times**.
+  - If `retrieval` reports "no results," do not re-call with the same search term -> change the search term or proceed to `finish`.
+  - Do not make additional calls when sufficient evidence already exists.
+
+## Output Format
+```json
+{"next_action": "retrieval | comparison | graph | chat | finish", "reason": "One-line justification"}
+```"""
     
     # 현재까지 수집된 context 정보를 프롬프트에 추가하여 루프 방지
     current_context = state.get("context", [])
@@ -452,6 +430,8 @@ def orchestrator_node(state: AgentState):
         print(f"[DEBUG Orchestrator] 파싱된 결정: {decision}")
 
         next_agent = decision.get("next_action", "answer")  # LLM이 next_action을 반환함
+        if next_agent == "finish":
+            next_agent = "answer"
         print(f"[DEBUG Orchestrator] next_agent 추출: {next_agent}")
 
         # 검증: 허용된 값만 통과 (state와 정확히 일치)

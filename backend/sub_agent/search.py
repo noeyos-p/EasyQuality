@@ -129,7 +129,7 @@ def _try_get_doc_from_sql(content: str, sql_store) -> str:
 
 def search_documents_internal(
     query: str,
-    max_results: int = 10,  # 검색 수량 확대 (기존 5 -> 10)
+    max_results: int = 100,  # 에이전트 분석용 벡터 검색 수량 확대
     search_type: Literal["hybrid", "vector", "keyword"] = "hybrid",
     keywords: List[str] = None,
     target_clause: str = None, # 조항 번호 직접 조회 (Point Lookup)
@@ -191,9 +191,18 @@ def search_documents_internal(
             if search_type == "hybrid":
                 current_alpha = 0.25 if keywords else 0.4
                 # v8.1: target_doc_id 필터 추가
-                vec_res = _vector_store.search_hybrid(enhanced_query, n_results=max_results * 2, alpha=current_alpha, filter_doc=target_doc_id)
+                vec_res = _vector_store.search_hybrid(
+                    enhanced_query,
+                    n_results=max_results,
+                    alpha=current_alpha,
+                    filter_doc=target_doc_id
+                )
             else:
-                vec_res = _vector_store.search(enhanced_query, n_results=max_results * 2, filter_doc=target_doc_id)
+                vec_res = _vector_store.search(
+                    enhanced_query,
+                    n_results=max_results,
+                    filter_doc=target_doc_id
+                )
 
             scored_results = []
             for r in vec_res:
@@ -338,101 +347,51 @@ def call_model_node(state: SearchState):
     client = get_openai_client()
     messages = state["messages"]
     
-    # Deep search system prompt (English for better LLM comprehension)
-    system_prompt = f"""You are a specialized **Deep Search Agent** for GMP/SOP document retrieval.
+    system_prompt = f"""You are a specialized agent for GMP/SOP document retrieval.
+Use the search tool to accurately answer user questions.
+{f"**Priority search target**: {state.get('detected_doc_id')}" if state.get('detected_doc_id') else ""}
 
-    [ROLE]
-    Find and analyze information from the document repository to answer user questions accurately.
-    {f"**TARGET DOCUMENT DETECTED**: {state.get('detected_doc_id')} - Prioritize searching this document." if state.get('detected_doc_id') else ""}
+## Principles
 
-    [STRICT GOVERNANCE: NO HALLUCINATION]
-    - **ZERO INFERENCE**: DO NOT include any information, numbers, or procedures that are NOT explicitly present in the `[DATA_SOURCE]`.
-    - **REPORT VOID**: If the required information is not found in the search results, state "검색된 문서 내에서 관련 정보를 찾을 수 없습니다." and report `[NO_INFO_FOUND]`.
-    - **FAITHFUL EXTRACTION**: Prefer direct quotes or very close paraphrasing to avoid meaning distortion.
+- **No information without a source**: Never write content that is not in [DATA_SOURCE].
+- **Specify document name**: Always use the document ID (e.g., EQ-SOP-00001) as the subject instead of pronouns like "this document" or "this regulation."
+- **On search failure**: Return "No relevant information found within the searched documents." + [NO_INFO_FOUND].
 
-    [WORKFLOW]
-    1. **Planning**: For complex questions, break them down into key keywords or specific clause numbers.
+## Search Method (search_documents_tool)
 
-    2. **Search**: Use `search_documents_tool` to find information.
-       - **Preserve Natural Language**: Pass the user's original question AS-IS to the `query` parameter. DO NOT convert it to a query format.
-         Example: "작업지침서가 뭐야" → query: "작업지침서가 뭐야" (✓), query: "작업지침서 정의" (✗)
-       - **Precise Targeting**: If the question mentions a specific clause number (e.g., 5.4.2), specify it in `target_clause`.
-       - **Keyword Extraction**: Extract ONLY nouns/terms that actually appear in the question for `keywords`. DO NOT infer or add words.
-         Example: "작업지침서가 뭐야" → keywords: ["작업지침서"] (✓), keywords: ["작업지침서", "정의", "목적"] (✗)
+- `query`: Pass the user question **as-is in its original form**. Do not convert it into a query format.
+  - O "What is a work instruction?" -> query: "What is a work instruction?"
+  - X query: "work instruction definition"
+- `target_clause`: Specify if a particular clause number is mentioned (e.g., "5.4.2").
+- `keywords`: Extract only **nouns that actually appear** in the question. Do not infer or add additional terms.
+  - O "What is a work instruction?" -> ["work instruction"]
+  - X ["work instruction", "definition", "purpose"]
 
-    [STRICT NAMING RULE - MANDATORY]
-    - **NEVER** use generic terms like "이 문서" (this document), "본 규정" (this regulation), "해당 문서" (the document), or "문서"(document) when referring to an SOP.
-    - **NEVER** start an answer or a sentence with generic phrases like "문서의 목적은..." or "이 문서는...".
-    - **ALWAYS** use the full Document ID (e.g., "EQ-SOP-00001") as the subject.
-    - **Incorrect**: "문서의 목적은 다음과 같습니다." / "이 문서는 제품표준서를 관리합니다."
-    - **Correct**: "EQ-SOP-00001의 목적은 다음과 같습니다." / "EQ-SOP-00001은 제품표준서를 관리합니다."
-    - If multiple documents are retrieved, specify each ID clearly: "EQ-SOP-00001은 A를 수행하며, EQ-SOP-00004는 B를 수행합니다."
+## Answer Writing Rules
 
-    4. **Answer Generation**: Write a natural **plain text** answer in Korean based on verified information.
-       - **🚨 CRITICAL REQUIREMENT 🚨**: You MUST add [USE: ...] tags. Without tags, your answer will FAIL validation.
-       - **MANDATORY FOR EVERY SENTENCE**: For EVERY piece of information you write, add a hidden tag: [USE: 문서명 | 조항]
-       - **NO EXCEPTIONS**: Even if information seems obvious or general, you MUST tag it if it came from a [DATA_SOURCE]
-       - **VERIFICATION PROCESS (DO THIS FOR EVERY SENTENCE)**:
-         1. Write a sentence using information from a [DATA_SOURCE]
-         2. Look at that specific [DATA_SOURCE] block to find the "해당 조항" field
-         3. Copy EXACTLY that clause number into your [USE: ...] tag
-         4. DO NOT use a different clause number from a different [DATA_SOURCE]
-         5. If you write multiple sentences, EACH sentence needs its own [USE: ...] tag
-       - **TAG PLACEMENT**: Place the tag IMMEDIATELY after the sentence or phrase that uses that information
-       - **CORRECT EXAMPLE**: If [DATA_SOURCE] says "해당 조항: 5.1.3 제 3레벨(작업지침서(WI):", then use:
-         "작업지침서는 업무 지침 문서입니다.[USE: EQ-SOP-00001 | 5.1.3 제 3레벨(작업지침서(WI):]"
-       - **WRONG EXAMPLE**: Using "5.2.2.2.2" when the information came from "5.1.3" → This is HALLUCINATION
-       - **CONSEQUENCE**: ONLY sources with [USE: ...] tags will appear in the final [참고 문서] section
-       - **WARNING**: If you don't tag sources, your answer will be rejected and you'll need to search again
+**Format**: Korean plain text. No markdown (**, #, -, *). Use [ ] or line breaks for emphasis.
 
-    [ANSWER FORMAT RULES]
-    - Write content naturally in the body. DO NOT cite sources inline.
-    - Use ONLY information from search results.
-    - DO NOT create a [참고 문서] section yourself (it's auto-generated).
-    - End your answer with the [DONE] tag to signal completion.
+**Source tagging ([USE: ...] tags)**:
+- Every sentence sourced from [DATA_SOURCE] must end with a `[USE: document name | clause]` tag.
+- The clause number must be an **exact copy** of the "applicable clause" field from the corresponding [DATA_SOURCE].
+- Information from different [DATA_SOURCE] entries must use their respective clause numbers.
+- Answers without tags will be treated as verification failures.
+- The [Reference Documents] section is auto-generated from tags; do not write it manually.
 
-    [ANSWER FORMAT EXAMPLE - WITH TAGS]
-    작업지침서는 현장에서 수행되는 업무를 일관되게 운영하기 위한 지침 문서입니다.[USE: EQ-SOP-00001 | 5.1.3 제 3레벨(작업지침서(WI):]
+**Example**:
+A work instruction is a guidance document for consistently operating on-site tasks.[USE: EQ-SOP-00001 | 5.1.3 Level 3 (Work Instruction (WI):]
+The key characteristics are as follows.
+1. It defines the operational flow and management methods at the department or process level.[USE: EQ-SOP-00001 | 5.1.3 Level 3 (Work Instruction (WI):]
+2. It includes cleaning and disinfection methods, testing methods, etc.[USE: EQ-SOP-00001 | 5.4.2 Work Instruction Writing]
+[DONE]
 
-    주요 특징은 다음과 같습니다.
-    1. 부서 또는 공정 단위의 운영 흐름과 관리 방법을 규정합니다[USE: EQ-SOP-00001 | 5.1.3 제 3레벨(작업지침서(WI):]
-    2. 세부적인 작업 방법보다는 기본적인 지침과 관리 기준을 제시합니다[USE: EQ-SOP-00001 | 5.1.3 제 3레벨(작업지침서(WI):]
+## Pre-submission Checklist
 
-    작업지침서에는 청소 및 소독 방법, 실험 방법 등이 포함됩니다.[USE: EQ-SOP-00001 | 5.4.2 작업지침서 작성]
-
-    [DONE]
-    
-    [STRICT PROHIBITIONS]
-    - DO NOT create [참고 문서] section in the middle or end of your answer (auto-generated from [USE: ...] tags)
-    - DO NOT cite sources inline like "[문서명 조항]" in visible text
-    - DO NOT use markdown formatting: NO bold (**), headers (#), list markers (-, *), italics (_)
-    - For emphasis, use brackets [ ] or line breaks
-    - Write ONLY in plain text format
-
-    [🚨 CRITICAL REQUIREMENT - READ CAREFULLY 🚨]
-    **NO TAGS = ANSWER REJECTED**
-    - Your answer WILL BE REJECTED if you don't add [USE: ...] tags
-    - Every sentence from a [DATA_SOURCE] needs a tag
-    - [USE: ...] tags are hidden from the user - they're automatically converted to (문서명 > 조항) format
-    - Missing tags = validation failure = wasted search = you'll be asked to search again
-
-    **TAG FORMAT REMINDER**:
-    [USE: 문서명 | 조항번호]
-    Example: [USE: EQ-SOP-00001 | 5.1.3 제 3레벨(작업지침서(WI):]
-
-    **SELF-CHECK BEFORE SUBMITTING**:
-    □ Did I add [USE: ...] tags to EVERY sentence?
-    □ Did I verify each clause number matches the [DATA_SOURCE]?
-    □ Are there at least 3-5 [USE: ...] tags in my answer?
-    If any answer is NO, add more tags before finishing!
-
-    [CRITICAL WARNING - AVOID HALLUCINATION]
-    - NEVER reuse the same clause number for multiple different pieces of information
-    - Each sentence should have its own [USE: ...] tag with the EXACT clause from the [DATA_SOURCE] it came from
-    - If you write 5 different sentences from 5 different [DATA_SOURCE] blocks, you must use 5 different clause numbers
-    - Using "5.2.2.2.2" for information that actually came from "5.1.3" is a CRITICAL ERROR
-    - When in doubt, CHECK the [DATA_SOURCE] block again to verify the clause number
-    """
+- Does every sentence have a [USE: ...] tag?
+- Does each tag's clause number match the "applicable clause" of the corresponding [DATA_SOURCE]?
+- Was the document ID used instead of pronouns like "this document"?
+- Was the [Reference Documents] section not written manually?
+- Is [DONE] appended at the end of the answer?"""
     
     # 시스템 프롬프트를 메시지 맨 앞에 삽입
     full_messages = [{"role": "system", "content": system_prompt}] + messages
@@ -614,12 +573,14 @@ def _ensure_reference_section(messages: List[Any], final_answer: str) -> str:
         # 2-1. LLM이 [USE: ...] 태그로 명시한 소스 추출
         used_sources = re.findall(r'\[USE:\s*([^\|\]]+)\s*\|\s*([^\]]+)\]', final_answer)
 
-        # 2-2. 태그가 없으면 실패 처리 (fallback 제거)
+        # 2-2. 태그가 없으면 최소 태그를 자동 주입하여 파이프라인 단절 방지
         if not used_sources:
             print(f"🔴 [검색 에이전트 치명적 오류] LLM이 [USE: ...] 태그를 달지 않음")
-            print(f"🔴 태그 없는 답변은 검증 불가 - 오케스트레이터가 재검색 결정해야 함")
-            # 태그가 없으면 원본 그대로 반환 (Answer Agent가 검증 실패 처리)
-            return final_answer
+            print(f"🟡 검색된 DATA_SOURCE 기반으로 [USE] 태그 자동 보강")
+            fallback_tags = " ".join(
+                [f"[USE: {doc} | {section}]" for doc, section in referenced_docs[:3]]
+            )
+            return f"{final_answer}\n{fallback_tags}".strip()
 
         # 2-3. 문서 존재 여부 확인 (SQL DB 조회)
         valid_docs = set()

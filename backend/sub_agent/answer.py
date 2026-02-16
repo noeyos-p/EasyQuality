@@ -66,6 +66,17 @@ def answer_agent_node(state: AgentState):
         search_report
     )
 
+    # 동일 문장이 연속 반복되는 경우 1회로 정리
+    deduped_lines = []
+    prev_norm = None
+    for line in converted.splitlines():
+        norm = re.sub(r'\s+', ' ', line).strip()
+        if norm and norm == prev_norm:
+            continue
+        deduped_lines.append(line)
+        prev_norm = norm if norm else prev_norm
+    converted = "\n".join(deduped_lines).strip()
+
     # ========================================
     # [참고 문서] 섹션 자동 생성
     # ========================================

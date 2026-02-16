@@ -32,16 +32,19 @@ def comparison_agent_node(state: AgentState):
 
     # 1. 의도 분석 (LangChain ChatOpenAI 사용 - LangSmith 자동 추적)
     # 사용자가 버전 목록을 보고 싶어하는지, 아니면 실제 내용 비교를 원하는지 구분
-    intent_prompt = f"""사용자의 질문을 분석하여 의도(Intent)와 필요한 정보를 추출하세요.
-    - 질문: {query}
+    intent_prompt = f"""Extract the intent and parameters from the user question.
+Question: {query}
 
-    [의도 분류]
-    - list_history: 특정 문서의 버전 목록(히스토리)이 보고 싶을 때 (예: 버전 종류, 히스토리, 이력 등)
-    - compare_versions: 두 버전 간의 내용을 구체적으로 비교하고 싶을 때. "최신 버전과 변경 내용", "차이점" 등을 물어보면 이에 해당합니다.
+## Intent Classification
 
-    반드시 JSON 형식으로만 답변하세요:
-    {{"intent": "list_history" 또는 "compare_versions", "doc_id": "문서ID", "v1": "버전1(없으면 null)", "v2": "버전2(없으면 null)"}}
-    """
+| Intent | Condition | Keyword Examples |
+|--------|-----------|------------------|
+| `list_history` | Retrieve version list/history of a specific document | "version types", "history", "revision log", "how many versions?" |
+| `compare_versions` | Compare content between two versions | "differences", "changes", "what changed?", "compare with latest version" |
+
+## Output (JSON only, no other text)
+
+{{"intent": "list_history | compare_versions", "doc_id": "document ID", "v1": "version 1 or null", "v2": "version 2 or null"}}"""
 
     try:
         # LangChain ChatOpenAI 사용 (JSON 응답)
@@ -164,39 +167,39 @@ def comparison_agent_node(state: AgentState):
                  return {"context": [f"### [비교 에이전트 오류]\n{doc_id}의 지정된 버전({v1}, {v2}) 데이터를 가져올 수 없습니다. [DONE]"]}
 
             # 3. 종합 분석 (Z.AI)
-            analysis_prompt = f"""다음은 두 버전의 문서 변경 사항(Diff)과, 해당 문서가 변경됨에 따라 영향을 받을 수 있는 다른 문서 목록(Impact)입니다.
-            이를 종합하여 '팩트 기반의 변경 및 영향 분석 보고서'를 작성하세요.
-            
-            [1. 실제 텍스트 변경 조항 (MODIFIED Only)]
-            {comp_data}
-            
-            [2. 영향 분석 (Impact Analysis)]
-            {impact_data}
-            
-            [보고서 작성 절대 원칙 - 사용자 피드백 반영]
-            1. 오직 위에 나열된 [1. 실제 텍스트 변경 조항]에 대해서만 설명하세요.
-            2. 마크다운(Markdown) 특수 기호를 절대 쓰지 마세요. (#, **, ---, -, * 금지)
-               - 블릿 기호( - 또는 * )도 절대 사용하지 말고 줄바꿈으로만 구분하세요.
-            3. 번호 체계는 '1.' 형식을 사용하세요.
-               예: 1. 변경 핵심 요약
-            4. 상세 비교 시 '전:' 내용과 '후:' 내용 사이에 반드시 줄바꿈을 넣으세요.
-            
-            [보고서 형식 가이드 - 이대로만 작성하세요]
-            1. 변경 핵심 요약
-            (요약 내용 작성)
-            
-            2. 상세 비교
-            [조항 4.1]
-            전: (변경 전 내용)
-            후: (변경 후 내용)
-            
-            [조항 4.2]
-            전: (내용)
-            후: (내용)
-            
-            3. 영향 평가
-            (영향 분석 내용 작성)
-            """
+            analysis_prompt = f"""Based on the change details (Diff) and impact analysis (Impact) data of the two versions, write a fact-based report.
+
+[Change Clause Data]
+{comp_data}
+
+[Impact Analysis Data]
+{impact_data}
+
+## Rules
+
+1. Only describe the clauses listed in the [Change Clause Data] above. Do not add content not present in the data.
+2. No markdown (#, **, ---, *, - bullets are all prohibited). Use only '1.' format for numbering.
+3. There must be a line break between "Before:" and "After:".
+
+## Report Format (follow this structure exactly)
+
+1. Key Change Summary
+(Summarize the number of changed clauses and the main direction of changes in 2-3 sentences)
+
+2. Detailed Comparison
+
+[Clause 4.1]
+Before: (content before the change)
+After: (content after the change)
+
+[Clause 4.2]
+Before: (content before the change)
+After: (content after the change)
+
+3. Impact Assessment
+(List the affected documents and the reasons)
+
+[DONE]"""
             
             try:
                 # LangChain ChatOpenAI 사용
