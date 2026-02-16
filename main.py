@@ -25,6 +25,7 @@ import uuid
 import asyncio
 import json
 import os
+import jwt
 from io import BytesIO
 
 from backend.sql_store import SQLStore
@@ -119,7 +120,14 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 chat_histories: Dict[str, List[Dict]] = {}
 chat_results: Dict[str, Dict] = {}
 chat_queue: asyncio.Queue = asyncio.Queue()
-chat_pending_ids: List[str] = []
+
+# ticket은 단조 증가(서버 살아있는 동안 1,2,3,4...)
+next_ticket: int = 0
+# pending은 request_id만 들고 있지 말고 ticket도 같이 들고 있게
+# [{"request_id": "...", "ticket": 1, "kind": "rag"|"agent"} ...]
+chat_pending: List[Dict] = []
+ticket_lock = asyncio.Lock()
+
 _graph_store = None
 
 QUEUE_STATE_FILE = "backend/queue_state.json"
@@ -1020,31 +1028,76 @@ async def process_chat_request(request: ChatRequest) -> Dict:
 async def chat_worker():
     """큐에서 질문을 하나씩 꺼내어 순차적으로 답변을 생성하는 워커."""
     while True:
-        request_id, request = await chat_queue.get()
+        request_id, ticket, kind, payload = await chat_queue.get()
         try:
-            print(f" 🚀 [Chat Worker] 처리 시작: {request_id}")
+            print(f" 🚀 [Chat Worker] 처리 시작: {request_id} (ticket: {ticket}, kind: {kind})")
             
-            # 프로세스 간 상태 동기화
             load_queue_state()
-            chat_results[request_id] = {"status": "processing", "result": None}
+            if request_id in chat_results:
+                chat_results[request_id]["status"] = "processing"
             save_queue_state()
 
-            result_data = await process_chat_request(request)
+            if kind == "rag":
+                req = ChatRequest(**payload)
+                result_data = await process_chat_request(req)
+
+            elif kind == "agent":
+                req = AgentRequest(**payload)
+                # 에이전트 도구 초기화 (동작 확인용으로 남겨둠, thread 내부에서 수행 권장)
+                from backend.agent import init_agent_tools, run_agent
+                
+                # 비차단/멀티스레드 호출로 변경 (동기 함수인 run_agent가 루프를 막지 않게 함)
+                result = await asyncio.to_thread(
+                    run_agent,
+                    query=req.message,
+                    session_id=req.session_id,
+                    model_name=req.llm_model,
+                    embedding_model=resolve_model_path(req.embedding_model)
+                )
+
+                answer = result.get("answer", "")
+                reasoning = result.get("reasoning", "")
+                
+                # 본문이 비어있으면 사고 과정(Think)을 답변으로 사용 (전처리 로직 동일화)
+                if not answer and reasoning:
+                    answer = f"[AI 분석 리포트]\n\n{reasoning}"
+
+                result_data = {
+                    "session_id": req.session_id,
+                    "answer": answer,
+                    "reasoning": reasoning,
+                    "tool_calls": result.get("tool_calls", []),
+                    "success": result.get("success", False),
+                    "mode": "langgraph" if (req.use_langgraph and LANGGRAPH_AGENT_AVAILABLE) else "simple"
+                }
+            else:
+                raise ValueError(f"Unknown kind: {kind}")
             
             load_queue_state()
-            chat_results[request_id] = {"status": "completed", "result": result_data}
+            if request_id in chat_results:
+                chat_results[request_id].update({
+                    "status": "completed",
+                    "result": result_data
+                })
             save_queue_state()
             
             print(f" ✅ [Chat Worker] 처리 완료: {request_id}")
         except Exception as e:
             print(f" 🔴 [Chat Worker] 에러: {e}")
+            import traceback
+            traceback.print_exc()
             load_queue_state()
-            chat_results[request_id] = {"status": "error", "error": str(e)}
+            if request_id in chat_results:
+                chat_results[request_id].update({
+                    "status": "error",
+                    "error": str(e)
+                })
             save_queue_state()
         finally:
             load_queue_state()
-            if request_id in chat_pending_ids:
-                chat_pending_ids.remove(request_id)
+            # pending에서 제거(request_id 기준)
+            # pending에서 제거(request_id 기준) - 인메모리 리스트 객체 보존을 위해 슬라이스 할당 사용
+            chat_pending[:] = [x for x in chat_pending if x["request_id"] != request_id]
             save_queue_state()
             chat_queue.task_done()
 
@@ -1063,10 +1116,52 @@ def _extract_user_id_from_auth_header(auth_header: Optional[str]) -> Optional[in
         return None
 
 
+async def enqueue_job(kind: str, payload: dict) -> dict:
+    """
+    kind: "rag" | "agent"
+    payload: worker가 처리할 요청 데이터(직렬화 가능한 dict)
+    """
+    global next_ticket, chat_pending
+
+    request_id = str(uuid.uuid4())
+
+    async with ticket_lock:
+        next_ticket += 1
+        ticket = next_ticket
+
+    load_queue_state()
+
+    # 대기열 엔트리 추가
+    chat_pending.append({"request_id": request_id, "ticket": ticket, "kind": kind})
+
+    # 상태 저장(클라이언트 status 조회용)
+    chat_results[request_id] = {
+        "status": "waiting",
+        "ticket": ticket,
+        "kind": kind,
+        "result": None,
+        "request": payload,
+    }
+    save_queue_state()
+
+    await chat_queue.put((request_id, ticket, kind, payload))
+
+    # position(현재 대기 순서) = pending에서 ticket 작은 애들 수 + 1
+    position = sum(1 for x in chat_pending if x["ticket"] < ticket) + 1
+
+    return {
+        "success": True,
+        "request_id": request_id,
+        "ticket": ticket,
+        "status": "waiting",
+        "position": position,
+        "message": f"질문이 대기열에 등록되었습니다. (현재 대기 순번: {position}번째)",
+    }
+
+
 @app.post("/chat")
 async def chat(chat_request: ChatRequest, http_request: Request):
     """순차 대기열 채팅 엔드포인트."""
-    request_id = str(uuid.uuid4())
     session_id = chat_request.session_id or str(uuid.uuid4())
     user_id = chat_request.user_id
     if user_id is None:
@@ -1078,49 +1173,35 @@ async def chat(chat_request: ChatRequest, http_request: Request):
         "user_id": user_id
     })
 
-    print(f" [Agent] 대기열 등록: {request_id} (session: {session_id}, user: {user_id})")
-
-    # 프로세스 간 상태 동기화 및 영속성 저장
-    load_queue_state()
-    chat_results[request_id] = {
-        "status": "waiting",
-        "result": None,
-        "request": queued_request.model_dump() # 복구를 위한 전체 요청 데이터 저장
-    }
-    chat_pending_ids.append(request_id)
-    save_queue_state()
-
-    await chat_queue.put((request_id, queued_request))
-    position = chat_pending_ids.index(request_id) + 1
-
-    return {
-        "success": True,
-        "request_id": request_id,
-        "session_id": session_id,
-        "message": f"질문이 대기열에 등록되었습니다. (현재 대기 순번: {position}번째)",
-        "status": "waiting",
-        "position": position
-    }
+    # 핵심: 큐 등록은 공통 함수 사용
+    return await enqueue_job(
+        kind="rag",
+        payload=queued_request.model_dump()
+    )
 
 
 @app.get("/chat/status/{request_id}")
 async def get_chat_status(request_id: str):
     """채팅 작업의 상태와 대기 순번 조회."""
-    # 최신 상태 로드 (다른 프로세스에서 변경했을 수 있음)
     load_queue_state()
     
     if request_id not in chat_results:
-        # 캐시에 없으면 한 번 더 로드 시도
-        load_queue_state()
-        if request_id not in chat_results:
-            raise HTTPException(404, "요청 ID를 찾을 수 없습니다.")
+        raise HTTPException(404, "요청 ID를 찾을 수 없습니다.")
 
     status_data = chat_results[request_id].copy()
 
-    # 대기 중이거나 처리 중인 경우 순번 반환 (인덱스 0 = 처리 중인 작업)
-    if request_id in chat_pending_ids:
-        status_data["position"] = chat_pending_ids.index(request_id) + 1
+    # ticket 상시 포함 보장 (이미 포함되어 있음)
+    # status가 'waiting'일 때만 position 계산하여 노출
+    if status_data.get("status") == "waiting":
+        mine = next((x for x in chat_pending if x["request_id"] == request_id), None)
+        if mine:
+            my_ticket = mine["ticket"]
+            # position(현재 대기 순서) = pending에서 내 티켓보다 작은 애들 수 + 1
+            status_data["position"] = sum(1 for x in chat_pending if x["ticket"] < my_ticket) + 1
+        else:
+            status_data.pop("position", None)
     else:
+        # processing, completed 등에서는 position 제외
         status_data.pop("position", None)
 
     return status_data
@@ -1993,72 +2074,26 @@ class AgentRequest(BaseModel):
 
 
 @app.post("/agent/chat")
-def agent_chat(request: AgentRequest):
+async def agent_chat(request: AgentRequest):
     """
      에이전트 채팅 - LLM이 도구를 선택해서 실행
     
     일반 RAG와 다르게 에이전트가 상황에 맞는 도구를 선택합니다:
     - search_sop_documents: 문서 내용 검색
-    - get_document_references: 문서 간 참조 관계
-    - search_sections_by_keyword: 키워드로 섹션 검색
-    - get_document_structure: 문서 구조/목차
-    - list_all_documents: 전체 문서 목록
     """
     if not AGENT_AVAILABLE:
         raise HTTPException(500, "에이전트 모듈이 로드되지 않았습니다")
     
     session_id = request.session_id or str(uuid.uuid4())
     
-    print(f"\n{'='*50}")
-    print(f"[에이전트] 질문: {request.message}")
-    print(f"  세션: {session_id}")
-    print(f"  모드: {'LangGraph' if request.use_langgraph else 'Simple'}")
-    print(f"  Orchestrator: gpt-4o-mini")
-    print(f"  Worker: {request.llm_model}")
+    # 기존 run_agent() 직접 호출 대신 큐에 넣기
+    payload = request.model_dump()
+    payload["session_id"] = session_id
 
-    try:
-        # 도구 초기화 (처음 한 번만)
-        init_agent_tools(vector_store, get_graph_store(), sql_store)
-        
-        # 통합된 멀티 에이전트 워크플로우 실행
-        result = run_agent(
-            query=request.message,
-            session_id=session_id,
-            model_name=request.llm_model,
-            embedding_model=resolve_model_path(request.embedding_model)
-        )
-        
-        reasoning = result.get("reasoning")
-        answer = result.get("answer", "")
-
-        # 본문(answer)이 비어있는데 reasoning만 있는 경우 (토큰 한도 초과 등으로 답변 생성 실패 시)
-        if not answer and reasoning:
-            print(" 본문이 직접적으로 수신되지 않아 사고 과정(Reasoning)을 답변으로 최우선 노출합니다.")
-            result["answer"] = f"[AI 분석 리포트]\n\n{reasoning}"
-            answer = result["answer"]
-        
-        if reasoning:
-            print(f" 모델의 생각(Reasoning) 추출됨 ({len(reasoning)}자)")
-            # 디버깅을 위해 첫 100자 정도 출력
-            reasoning_preview = reasoning[:150].replace('\n', ' ')
-            print(f"   [THINK] {reasoning_preview}...")
-        
-        print(f"   도구 호출: {len(result.get('tool_calls', []))}회")
-        print(f"   답변 길이: {len(result.get('answer', ''))} 글자")
-        print(f"{'='*50}\n")
-        
-        return {
-            "session_id": session_id,
-            "answer": result.get("answer", ""),
-            "tool_calls": result.get("tool_calls", []),
-            "success": result.get("success", False),
-            "mode": "langgraph" if (request.use_langgraph and LANGGRAPH_AGENT_AVAILABLE) else "simple"
-        }
-    
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(500, f"에이전트 실행 실패: {str(e)}")
+    return await enqueue_job(
+        kind="agent",
+        payload=payload
+    )
 
 
 @app.get("/agent/status")
@@ -2867,7 +2902,7 @@ def main():
     print("  - LangSmith 추적 지원")
     print("=" * 60)
     
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000, workers=1)
 
 
 if __name__ == "__main__":

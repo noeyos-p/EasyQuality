@@ -39,6 +39,7 @@ export interface ChatMessage {
   evaluation_scores?: EvaluationScores
   isWaiting?: boolean
   queuePosition?: number
+  ticket?: number
   status?: 'waiting' | 'processing' | 'completed' | 'error'
 }
 

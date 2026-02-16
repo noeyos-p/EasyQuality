@@ -101,6 +101,7 @@ export default function ChatPanel({ isVisible, onDocumentSelect }: ChatPanelProp
             thinkingTime,
             evaluation_scores: result?.evaluation_scores,
             status: 'completed',
+            ticket: data.ticket, // 티켓 번호 유지
             isWaiting: false,
           })
 
@@ -115,11 +116,12 @@ export default function ChatPanel({ isVisible, onDocumentSelect }: ChatPanelProp
             }, 4000)
           }
         } else if (data.status === 'waiting') {
-          if (data.position !== lastPosition) {
+          if (data.position !== lastPosition || data.ticket) {
             lastPosition = data.position
             updateMessage(targetId, {
               status: 'waiting',
-              queuePosition: data.position || 1,
+              queuePosition: data.position || 0,
+              ticket: data.ticket
             })
           }
         } else if (data.status === 'processing') {
@@ -206,8 +208,12 @@ export default function ChatPanel({ isVisible, onDocumentSelect }: ChatPanelProp
           setSessionId(data.session_id)
         }
 
-        if (data.position) {
-          updateMessage(assistantId, { queuePosition: data.position, status: 'waiting' })
+        if (data.position || data.ticket) {
+          updateMessage(assistantId, {
+            queuePosition: data.position || 0,
+            ticket: data.ticket,
+            status: 'waiting'
+          })
         }
 
         pollAnswer(requestId, startTime, assistantId)
@@ -326,14 +332,6 @@ export default function ChatPanel({ isVisible, onDocumentSelect }: ChatPanelProp
             </div>
           ))}
 
-          {isLoading && (
-            <div className="flex flex-col gap-2">
-              <div className="typing-indicator">
-                <span></span><span></span><span></span>
-                Processing request...
-              </div>
-            </div>
-          )}
           <div ref={chatEndRef} />
         </div>
 

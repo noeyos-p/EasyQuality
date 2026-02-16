@@ -73,7 +73,7 @@ export default function ChatMessage({ msg, index, expandedSections, toggleSectio
             <span className="text-[13px] text-txt-secondary">
               {isProcessing
                 ? '에이전트가 답변을 작성하고 있습니다...'
-                : `답변 대기 중... (현재 순번: ${msg.queuePosition || 1}번째)`}
+                : `답변 대기 중... (${msg.queuePosition ? `순번 ${msg.queuePosition}번째` : '순번 계산 중...'})`}
             </span>
           </div>
         </div>
