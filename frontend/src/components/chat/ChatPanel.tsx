@@ -35,9 +35,12 @@ export default function ChatPanel({ isVisible, onDocumentSelect }: ChatPanelProp
   const [expandedSections, setExpandedSections] = useState<Set<string>>(new Set())
 
   const chatEndRef = useRef<HTMLDivElement>(null)
+  const prevMessageCountRef = useRef(0)
 
   useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    const isNewMessageAdded = messages.length > prevMessageCountRef.current
+    chatEndRef.current?.scrollIntoView({ behavior: isNewMessageAdded ? 'smooth' : 'auto' })
+    prevMessageCountRef.current = messages.length
   }, [messages])
 
   useEffect(() => {
