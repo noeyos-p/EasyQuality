@@ -6,7 +6,7 @@ import { API_URL } from '../../types'
 
 interface ChatPanelProps {
   isVisible: boolean
-  onDocumentSelect: (docId: string) => void
+  onDocumentSelect: (docId: string, docType?: string, clause?: string) => void
 }
 
 export default function ChatPanel({ isVisible, onDocumentSelect }: ChatPanelProps) {
@@ -241,6 +241,13 @@ export default function ChatPanel({ isVisible, onDocumentSelect }: ChatPanelProp
   const handleKeyPress = (e: React.KeyboardEvent) => {
     const isComposing = (e.nativeEvent as KeyboardEvent).isComposing || e.key === 'Process'
     if (isComposing) return
+
+    // 입력창이 비어있을 때 Backspace로 마지막 선택 문서 태그 제거
+    if (e.key === 'Backspace' && !inputMessage.trim() && selectedDocs.length > 0) {
+      e.preventDefault()
+      setSelectedDocs(prev => prev.slice(0, -1))
+      return
+    }
 
     if (e.key === 'Enter' && !e.shiftKey) {
       if (showSuggestions && suggestions.length > 0) {

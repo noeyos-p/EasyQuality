@@ -9,28 +9,60 @@ interface ChatMessageProps {
   index: number
   expandedSections: Set<string>
   toggleSection: (section: string) => void
-  onDocumentSelect: (docId: string) => void
+  onDocumentSelect: (docId: string, docType?: string, clause?: string) => void
 }
 
 const DOC_PATTERN = /(EQ-(?:SOP|WI|FRM)-\d{4,6}(?:\([\d.,\s]+\))?)/g
 const DOC_TOKEN_PATTERN = /^EQ-(?:SOP|WI|FRM)-\d{4,6}(?:\([\d.,\s]+\))?$/
 
-function processText(text: string, onDocumentSelect: (docId: string) => void) {
+function processText(text: string, onDocumentSelect: (docId: string, docType?: string, clause?: string) => void) {
   const parts = text.split(DOC_PATTERN)
   return parts.map((part, i) => {
     if (DOC_TOKEN_PATTERN.test(part)) {
-      const docId = part
-        .split('(')[0]
+      const token = part
         .replace(/^@/, '')
         .replace(/[.,;:!?]+$/, '')
         .trim()
+      const match = token.match(/^(EQ-(?:SOP|WI|FRM)-\d{4,6})(?:\(([^)]+)\))?$/)
+      const docId = match?.[1] ?? token
+      const rawClause = match?.[2]?.trim()
+      const clauses = rawClause
+        ? rawClause.split(',').map(v => v.trim()).filter(Boolean)
+        : []
+
+      if (clauses.length === 0) {
+        return (
+          <span
+            key={i}
+            className="text-accent underline cursor-pointer font-medium px-1 py-[1px] rounded transition-all duration-200 hover:bg-white/10 hover:text-accent-hover"
+            onClick={() => onDocumentSelect(docId)}
+          >
+            {part}
+          </span>
+        )
+      }
+
       return (
-        <span
-          key={i}
-          className="text-accent underline cursor-pointer font-medium px-1 py-[1px] rounded transition-all duration-200 hover:bg-white/10 hover:text-accent-hover"
-          onClick={() => onDocumentSelect(docId)}
-        >
-          {part}
+        <span key={i} className="px-1 py-[1px]">
+          <span
+            className="text-accent underline cursor-pointer font-medium rounded transition-all duration-200 hover:bg-white/10 hover:text-accent-hover"
+            onClick={() => onDocumentSelect(docId)}
+          >
+            {docId}
+          </span>
+          <span>(</span>
+          {clauses.map((clause, idx) => (
+            <span key={`${docId}-${clause}-${idx}`}>
+              <span
+                className="text-accent underline cursor-pointer font-medium rounded transition-all duration-200 hover:bg-white/10 hover:text-accent-hover"
+                onClick={() => onDocumentSelect(docId, undefined, clause)}
+              >
+                {clause}
+              </span>
+              {idx < clauses.length - 1 ? <span>, </span> : null}
+            </span>
+          ))}
+          <span>)</span>
         </span>
       )
     }
@@ -39,7 +71,7 @@ function processText(text: string, onDocumentSelect: (docId: string) => void) {
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-function recurse(node: any, onDocumentSelect: (docId: string) => void): any {
+function recurse(node: any, onDocumentSelect: (docId: string, docType?: string, clause?: string) => void): any {
   if (typeof node === 'string') return processText(node, onDocumentSelect)
   if (Array.isArray(node)) return node.map(n => recurse(n, onDocumentSelect))
   if (node?.props?.children) {

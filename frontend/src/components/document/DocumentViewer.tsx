@@ -3,6 +3,7 @@ import { API_URL } from '../../types'
 
 interface DocumentViewerProps {
   selectedDocument: string
+  targetClause?: string | null
   documentContent: string | null
   isEditing: boolean
   editedContent: string
@@ -16,6 +17,7 @@ interface DocumentViewerProps {
 
 export default function DocumentViewer({
   selectedDocument,
+  targetClause = null,
   documentContent,
   isEditing,
   editedContent,
@@ -32,6 +34,48 @@ export default function DocumentViewer({
   const htmlRenderRef = React.useRef<HTMLDivElement | null>(null)
 
   void onlyOfficeEditorMode
+
+  React.useEffect(() => {
+    if (!targetClause || isEditing || isOnlyOfficeMode || !documentContent) return
+
+    const normalized = targetClause.trim()
+    if (!normalized) return
+
+    const candidates = normalized
+      .split(',')
+      .map(v => v.trim().replace(/\.+$/, ""))
+      .filter(Boolean)
+      // 더 구체적인 조항(깊이/길이)이 먼저 매칭되도록 정렬
+      .sort((a, b) => {
+        const depthDiff = b.split('.').length - a.split('.').length
+        if (depthDiff !== 0) return depthDiff
+        return b.length - a.length
+      })
+    const timer = window.setTimeout(() => {
+      const root = htmlRenderRef.current
+      if (!root) return
+
+      let targetEl: HTMLElement | null = null
+      for (const clause of candidates) {
+        const escaped = (window as any).CSS?.escape ? (window as any).CSS.escape(clause) : clause.replace(/"/g, '\\"')
+        const found = root.querySelector(`[data-clause="${escaped}"]`) as HTMLElement | null
+        if (found) {
+          targetEl = found
+          break
+        }
+      }
+
+      if (!targetEl) return
+
+      targetEl.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      targetEl.classList.add('ring-2', 'ring-accent-blue', 'rounded')
+      window.setTimeout(() => {
+        targetEl?.classList.remove('ring-2', 'ring-accent-blue', 'rounded')
+      }, 2200)
+    }, 80)
+
+    return () => window.clearTimeout(timer)
+  }, [targetClause, selectedDocument, documentContent, isEditing, isOnlyOfficeMode])
 
   // OnlyOffice 에디터 초기화
   React.useEffect(() => {
@@ -280,13 +324,13 @@ export default function DocumentViewer({
 
         if (globalDepth === 0) {
           elements.push(
-            <div key={`section-${lineIdx}`} className="text-[16px] font-bold mt-[60px] mb-[8px] text-black border-b border-[#e0e0e0] pb-[10px]" style={sectionStyle}>
+            <div key={`section-${lineIdx}`} data-clause={sectionNum} className="text-[16px] font-bold mt-[60px] mb-[8px] text-black border-b border-[#e0e0e0] pb-[10px] transition-all duration-300" style={sectionStyle}>
               {displayText}
             </div>
           )
         } else {
           elements.push(
-            <div key={`section-${lineIdx}`} className="text-[15px] font-normal mt-[28px] mb-[8px] text-black" style={sectionStyle}>
+            <div key={`section-${lineIdx}`} data-clause={sectionNum} className="text-[15px] font-normal mt-[28px] mb-[8px] text-black transition-all duration-300" style={sectionStyle}>
               {displayText}
             </div>
           )
@@ -405,4 +449,3 @@ export default function DocumentViewer({
     </div>
   )
 }
-

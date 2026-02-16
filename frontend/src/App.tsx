@@ -20,6 +20,7 @@ function App() {
 
   // 문서 상태
   const [selectedDocument, setSelectedDocument] = useState<string | null>(null)
+  const [selectedClause, setSelectedClause] = useState<string | null>(null)
   const [documentContent, setDocumentContent] = useState<string | null>(null)
   const [isEditing, setIsEditing] = useState(false)
   const [editedContent, setEditedContent] = useState<string>('')
@@ -67,8 +68,9 @@ function App() {
     checkBackendStatus()
   }, [])
 
-  const handleDocumentSelect = async (docId: string, docType?: string) => {
+  const handleDocumentSelect = async (docId: string, docType?: string, clause?: string) => {
     setSelectedDocument(docId)
+    setSelectedClause(clause || null)
     setIsEditing(false)
     setIsOnlyOfficeMode(false)
     setOnlyOfficeConfig(null)
@@ -135,6 +137,7 @@ function App() {
 
   const handleCloseViewer = () => {
     setSelectedDocument(null)
+    setSelectedClause(null)
     setDocumentContent(null)
     setIsOnlyOfficeMode(false)
     setOnlyOfficeConfig(null)
@@ -382,6 +385,7 @@ function App() {
           ) : selectedDocument && (documentContent || isOnlyOfficeMode) ? (
             <DocumentViewer
               selectedDocument={selectedDocument}
+              targetClause={selectedClause}
               documentContent={documentContent}
               isEditing={isEditing}
               editedContent={editedContent}
