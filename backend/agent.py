@@ -412,6 +412,16 @@ You direct sub-agents to resolve user questions and verify reported results.
         print(f" [Guardrail] 메타 질문 감지 -> 'chat' 강제 라우팅 ('{last_user_msg}')")
         return {"next_agent": "chat", "loop_count": loop_count + 1, "agent_calls": agent_calls}
 
+    # [Guardrail] 관계/참조/영향 질문은 graph 에이전트 우선 라우팅
+    relation_keywords = [
+        "관계", "참조", "인용", "연결", "상위문서", "하위문서", "근거 문서", "영향", "파급",
+        "reference", "citation", "dependency", "impact", "relationship", "related regulation"
+    ]
+    is_relation_query = any(k.lower() in last_user_msg.lower() for k in relation_keywords)
+    if is_relation_query and "graph" not in agent_calls and loop_count == 0:
+        print(f" [Guardrail] 관계 질문 감지 -> 'graph' 강제 라우팅 ('{last_user_msg}')")
+        return {"next_agent": "graph", "loop_count": loop_count + 1, "agent_calls": agent_calls}
+
     try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",

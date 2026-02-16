@@ -12,13 +12,18 @@ interface ChatMessageProps {
   onDocumentSelect: (docId: string) => void
 }
 
-const DOC_PATTERN = /(EQ-(?:SOP|WI)-\d{5}(?:\([\d.,\s]+\))?)/g
+const DOC_PATTERN = /(EQ-(?:SOP|WI|FRM)-\d{4,6}(?:\([\d.,\s]+\))?)/g
+const DOC_TOKEN_PATTERN = /^EQ-(?:SOP|WI|FRM)-\d{4,6}(?:\([\d.,\s]+\))?$/
 
 function processText(text: string, onDocumentSelect: (docId: string) => void) {
   const parts = text.split(DOC_PATTERN)
   return parts.map((part, i) => {
-    if (DOC_PATTERN.test(part)) {
-      const docId = part.split('(')[0].replace(/^@/, '')
+    if (DOC_TOKEN_PATTERN.test(part)) {
+      const docId = part
+        .split('(')[0]
+        .replace(/^@/, '')
+        .replace(/[.,;:!?]+$/, '')
+        .trim()
       return (
         <span
           key={i}
@@ -44,17 +49,48 @@ function recurse(node: any, onDocumentSelect: (docId: string) => void): any {
 }
 
 export default function ChatMessage({ msg, index, expandedSections, toggleSection, onDocumentSelect }: ChatMessageProps) {
+  const markdownTextComponents = {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    p({ children }: any) {
+      return <p>{recurse(children, onDocumentSelect)}</p>
+    },
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    li({ children }: any) {
+      return <li>{recurse(children, onDocumentSelect)}</li>
+    },
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    h1({ children }: any) {
+      return <h1>{recurse(children, onDocumentSelect)}</h1>
+    },
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    h2({ children }: any) {
+      return <h2>{recurse(children, onDocumentSelect)}</h2>
+    },
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    h3({ children }: any) {
+      return <h3>{recurse(children, onDocumentSelect)}</h3>
+    },
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    h4({ children }: any) {
+      return <h4>{recurse(children, onDocumentSelect)}</h4>
+    },
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    h5({ children }: any) {
+      return <h5>{recurse(children, onDocumentSelect)}</h5>
+    },
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    h6({ children }: any) {
+      return <h6>{recurse(children, onDocumentSelect)}</h6>
+    },
+  }
+
   if (msg.role === 'user') {
     return (
       <div className="bg-dark-light rounded-lg p-3 border border-dark-border">
         <div className="flex-1 text-[13px] text-txt-primary">
           <ReactMarkdown
             remarkPlugins={[remarkGfm]}
-            components={{
-              p({ children }) {
-                return <p>{recurse(children, onDocumentSelect)}</p>
-              }
-            }}
+            components={markdownTextComponents}
           >
             {msg.content}
           </ReactMarkdown>
@@ -108,9 +144,7 @@ export default function ChatMessage({ msg, index, expandedSections, toggleSectio
         <ReactMarkdown
           remarkPlugins={[remarkGfm]}
           components={{
-            p({ children }) {
-              return <p>{recurse(children, onDocumentSelect)}</p>
-            },
+            ...markdownTextComponents,
             code({ node, inline, className, children, ...props }: any) {
               const match = /language-(\w+)/.exec(className || '')
               const language = match ? match[1] : ''
