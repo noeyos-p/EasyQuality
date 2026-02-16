@@ -106,6 +106,11 @@ class DeleteDocRequest(BaseModel):
     collection: str = "documents"
     delete_from_neo4j: bool = True
 
+class DeleteDocsBatchRequest(BaseModel):
+    doc_names: List[str]
+    collection: str = "documents"
+    delete_from_neo4j: bool = True
+
 class SaveDocRequest(BaseModel):
     doc_name: str
     content: str
@@ -1264,35 +1269,76 @@ def extract_document_category(doc_id: str) -> str:
 
 @app.get("/rag/documents")
 async def list_documents(collection: str = "documents"):
-    """문서 목록 (RDB에서 조회)"""
+    """문서 목록 (RDB + S3 DOCX 병합 조회)"""
     try:
         # SQL Store에서 모든 문서 조회 (비동기 처리)
         all_docs = await asyncio.to_thread(sql_store.get_all_documents)
 
+        def _normalize_doc_type(v: Optional[str]) -> str:
+            t = (v or "").lower()
+            if "pdf" in t:
+                return "pdf"
+            if "docx" in t:
+                return "docx"
+            return t or "other"
+
         # 문서별로 그룹화 (같은 문서의 여러 버전)
-        docs_dict = {}
+        grouped: Dict[str, List[Dict]] = {}
         for doc in all_docs:
-            doc_name = doc.get('doc_name')
-            if doc_name not in docs_dict:
-                # 첫 번째 버전을 대표로 사용
-                docs_dict[doc_name] = {
+            doc_name = doc.get("doc_name")
+            if not doc_name:
+                continue
+            grouped.setdefault(doc_name, []).append(doc)
+
+        docs_out: List[Dict] = []
+        for doc_name, versions in grouped.items():
+            # 동일 문서명에서 pdf가 하나라도 있으면 pdf 계열만 대표 후보로 사용
+            pdf_versions = [d for d in versions if _normalize_doc_type(d.get("doc_type")) == "pdf"]
+            candidates = pdf_versions if pdf_versions else versions
+
+            def _sort_key(d: Dict):
+                created = d.get("created_at")
+                if hasattr(created, "timestamp"):
+                    created_key = created.timestamp()
+                else:
+                    created_key = 0
+                return (created_key, str(d.get("version") or "0"))
+
+            # 대표 문서는 created_at 최신 우선 (없으면 version 문자열로 보조)
+            selected = max(candidates, key=_sort_key)
+
+            docs_out.append({
+                "doc_id": doc_name,
+                "doc_name": doc_name,
+                "doc_type": selected.get("doc_type"),
+                "doc_format": _normalize_doc_type(selected.get("doc_type")),
+                "doc_category": extract_document_category(doc_name),
+                "version": selected.get("version"),
+                "created_at": selected.get("created_at"),
+                "latest_version": selected.get("version"),
+                "source": "rdb",
+            })
+
+        # S3 DOCX 문서 병합: 동일 doc_name이 있어도 숨기지 않고 표시
+        try:
+            s3_docs = await asyncio.to_thread(get_s3_store().list_docx_documents)
+            for s3_doc in s3_docs:
+                doc_name = s3_doc.get("doc_name")
+                docs_out.append({
                     "doc_id": doc_name,
                     "doc_name": doc_name,
-                    "doc_type": doc.get('doc_type'),
-                    "doc_category": extract_document_category(doc_name),  # 문서 분류 추가
-                    "version": doc.get('version'),
-                    "created_at": doc.get('created_at'),
-                    "latest_version": doc.get('version')
-                }
-            else:
-                # 최신 버전 업데이트
-                current = docs_dict[doc_name]
-                if doc.get('version', '0') > current.get('latest_version', '0'):
-                    current['latest_version'] = doc.get('version')
-                    current['version'] = doc.get('version')
-                    current['created_at'] = doc.get('created_at')
+                    "doc_type": "docx",
+                    "doc_format": "docx",
+                    "doc_category": extract_document_category(doc_name),
+                    "version": s3_doc.get("version"),
+                    "created_at": s3_doc.get("created_at"),
+                    "latest_version": s3_doc.get("latest_version"),
+                    "source": "s3",
+                })
+        except Exception as s3_err:
+            print(f"S3 DOCX 목록 병합 실패(무시): {s3_err}")
 
-        return {"documents": list(docs_dict.values()), "collection": collection}
+        return {"documents": docs_out, "collection": collection}
     except Exception as e:
         print(f"문서 목록 조회 실패: {e}")
         return {"documents": [], "collection": collection}
@@ -1530,51 +1576,161 @@ async def download_document(
 @app.delete("/rag/document")
 def delete_document(request: DeleteDocRequest):
     """
-    문서 삭제 (RDB + Weaviate + Neo4j 전체 삭제)
+    문서 삭제 (RDB + Weaviate + Neo4j 전체 삭제 + 삭제 검증)
     """
-    result = {"rdb": None, "weaviate": None, "neo4j": None}
+    print(f"\n[DELETE] 단건 삭제 요청: doc={request.doc_name}, collection={request.collection}, neo4j={request.delete_from_neo4j}")
+    result = _delete_document_everywhere(
+        doc_name=request.doc_name,
+        collection=request.collection,
+        delete_from_neo4j=request.delete_from_neo4j,
+    )
+    print(f"[DELETE] 단건 삭제 결과: doc={request.doc_name}, success={result.get('success')}, details={result.get('details')}")
+    return {
+        "success": result.get("success", False),
+        "doc_name": request.doc_name,
+        "details": result.get("details", {}),
+    }
 
-    # 1. RDB (PostgreSQL) 삭제
-    try:
-        rdb_ok = sql_store.delete_document_by_name(request.doc_name)
-        result["rdb"] = {"success": rdb_ok}
-    except Exception as e:
-        result["rdb"] = {"success": False, "error": str(e)}
 
-    # 2. Weaviate (Vector DB) 삭제
-    try:
-        weaviate_result = vector_store.delete_by_doc_name(
-            doc_name=request.doc_name,
-            collection_name=request.collection
+@app.post("/rag/documents/delete-batch")
+def delete_documents_batch(request: DeleteDocsBatchRequest):
+    """
+    문서 다건 삭제 (RDB + Weaviate + Neo4j 전체 삭제 + 삭제 검증)
+    - 하나라도 삭제 검증에 실패하면 overall_success=False
+    """
+    doc_names = [d.strip() for d in request.doc_names if d and d.strip()]
+    if not doc_names:
+        raise HTTPException(400, "삭제할 문서가 없습니다.")
+
+    # 중복 제거(순서 유지)
+    unique_doc_names = list(dict.fromkeys(doc_names))
+    print(f"\n[DELETE] 배치 삭제 요청: count={len(unique_doc_names)}, docs={unique_doc_names}, collection={request.collection}, neo4j={request.delete_from_neo4j}")
+    results = []
+    success_count = 0
+
+    for doc_name in unique_doc_names:
+        item = _delete_document_everywhere(
+            doc_name=doc_name,
+            collection=request.collection,
+            delete_from_neo4j=request.delete_from_neo4j,
         )
-        result["weaviate"] = weaviate_result
-    except Exception as e:
-        result["weaviate"] = {"success": False, "error": str(e)}
+        results.append({
+            "doc_name": doc_name,
+            **item,
+        })
+        if item.get("success"):
+            success_count += 1
+        else:
+            print(f"[DELETE] 배치 항목 실패: doc={doc_name}, details={item.get('details')}")
 
-    # 3. Neo4j (Graph DB) 삭제
-    try:
-        graph = get_graph_store()
-        if graph.test_connection():
-            # EQ-SOP-xxxxx, EQ-WI-xxxxx, EQ-FRM-xxxxx 패턴 모두 처리
-            doc_id_match = re.search(r'(EQ-(?:SOP|WI|FRM)-\d+)', request.doc_name, re.IGNORECASE)
-            if doc_id_match:
-                doc_id = doc_id_match.group(1).upper()
-                graph.delete_document(doc_id)
-                result["neo4j"] = {"success": True, "doc_id": doc_id}
-            else:
-                # 패턴 없으면 doc_name 그대로 시도
-                graph.delete_document(request.doc_name)
-                result["neo4j"] = {"success": True, "doc_id": request.doc_name}
-    except Exception as e:
-        result["neo4j"] = {"success": False, "error": str(e)}
-
-    success = result["rdb"].get("success", False) or result["weaviate"].get("success", False)
+    print(f"[DELETE] 배치 삭제 결과: success={success_count}/{len(unique_doc_names)}")
 
     return {
-        "success": success,
-        "doc_name": request.doc_name,
-        "details": result
+        "success": success_count == len(unique_doc_names),
+        "requested_count": len(unique_doc_names),
+        "deleted_count": success_count,
+        "failed_count": len(unique_doc_names) - success_count,
+        "results": results,
     }
+
+
+def _delete_document_everywhere(doc_name: str, collection: str, delete_from_neo4j: bool = True) -> Dict:
+    """문서 1건을 세 저장소에서 삭제하고 실제 삭제 여부를 검증한다."""
+    result = {"rdb": None, "weaviate": None, "neo4j": None, "s3_docx": None}
+    print(f"[DELETE] 처리 시작: doc={doc_name}")
+    doc_id_match = re.search(r'(EQ-(?:SOP|WI|FRM)-\d+)', doc_name, re.IGNORECASE)
+    normalized_doc_id = doc_id_match.group(1).upper() if doc_id_match else None
+    candidate_names = [doc_name]
+    if normalized_doc_id and normalized_doc_id not in candidate_names:
+        candidate_names.insert(0, normalized_doc_id)
+    print(f"[DELETE] 후보 키: {candidate_names}")
+
+    # 1) RDB 삭제 + 검증
+    try:
+        for name in candidate_names:
+            sql_store.delete_document_by_name(name)
+        still_exists = any(sql_store.get_document_by_name(name) is not None for name in candidate_names)
+        result["rdb"] = {"success": not still_exists, "exists_after_delete": still_exists, "candidates": candidate_names}
+        print(f"[DELETE][RDB] doc={doc_name}, exists_after_delete={still_exists}, candidates={candidate_names}")
+    except Exception as e:
+        result["rdb"] = {"success": False, "error": str(e)}
+        print(f"[DELETE][RDB] doc={doc_name}, error={e}")
+
+    # 2) Weaviate 삭제 + 검증
+    try:
+        deleted_total = 0
+        for name in candidate_names:
+            delete_res = vector_store.delete_by_doc_name(doc_name=name, collection_name=collection)
+            deleted_total += int(delete_res.get("deleted", 0))
+        docs_after = vector_store.list_documents(collection_name=collection)
+        remains = any(
+            (d.get("doc_id") in candidate_names) or (d.get("doc_name") in candidate_names)
+            for d in docs_after
+        )
+        result["weaviate"] = {
+            "success": not remains,
+            "deleted": deleted_total,
+            "exists_after_delete": remains,
+            "candidates": candidate_names,
+        }
+        print(f"[DELETE][Weaviate] doc={doc_name}, deleted={deleted_total}, exists_after_delete={remains}, candidates={candidate_names}")
+    except Exception as e:
+        result["weaviate"] = {"success": False, "error": str(e)}
+        print(f"[DELETE][Weaviate] doc={doc_name}, error={e}")
+
+    # 3) Neo4j 삭제 + 검증
+    try:
+        if not delete_from_neo4j:
+            result["neo4j"] = {"success": True, "skipped": True}
+            print(f"[DELETE][Neo4j] doc={doc_name}, skipped=True")
+        else:
+            graph = get_graph_store()
+            if not graph.test_connection():
+                result["neo4j"] = {"success": False, "error": "Neo4j 연결 실패"}
+                print(f"[DELETE][Neo4j] doc={doc_name}, error=Neo4j 연결 실패")
+            else:
+                candidate_ids = candidate_names[:]
+
+                for candidate in candidate_ids:
+                    graph.delete_document(candidate)
+
+                remains = any(graph.get_document(candidate) for candidate in candidate_ids)
+                result["neo4j"] = {
+                    "success": not remains,
+                    "doc_ids": candidate_ids,
+                    "exists_after_delete": remains,
+                }
+                print(f"[DELETE][Neo4j] doc={doc_name}, doc_ids={candidate_ids}, exists_after_delete={remains}")
+    except Exception as e:
+        result["neo4j"] = {"success": False, "error": str(e)}
+        print(f"[DELETE][Neo4j] doc={doc_name}, error={e}")
+
+    # 4) S3 DOCX 삭제 + 검증
+    try:
+        s3 = get_s3_store()
+        deleted_count = 0
+        for name in candidate_names:
+            deleted_count += s3.delete_docx_versions(name)
+        remains = any(s3.has_docx(name) for name in candidate_names)
+        result["s3_docx"] = {
+            "success": not remains,
+            "deleted": deleted_count,
+            "exists_after_delete": remains,
+            "candidates": candidate_names,
+        }
+        print(f"[DELETE][S3-DOCX] doc={doc_name}, deleted={deleted_count}, exists_after_delete={remains}, candidates={candidate_names}")
+    except Exception as e:
+        result["s3_docx"] = {"success": False, "error": str(e)}
+        print(f"[DELETE][S3-DOCX] doc={doc_name}, error={e}")
+
+    success = (
+        result["rdb"].get("success", False)
+        and result["weaviate"].get("success", False)
+        and result["neo4j"].get("success", False)
+        and result["s3_docx"].get("success", False)
+    )
+    print(f"[DELETE] 처리 종료: doc={doc_name}, success={success}")
+    return {"success": success, "details": result}
 
 
 @app.get("/rag/collections")
@@ -2445,13 +2601,7 @@ async def upload_docx_to_s3(
     collection: str = Form("documents"),
 ):
     """
-    DOCX 파일을 S3에 저장 후 RAG 파이프라인 실행
-
-    입력: file (DOCX), doc_name (문서 ID), version
-    동작:
-      1. S3에 저장 (documents/{doc_name}/v{version}/document.docx)
-      2. DOCX → 마크다운 변환
-      3. Weaviate + PostgreSQL + Neo4j 저장
+    DOCX 파일을 S3에만 저장 (파싱/인덱싱 생략)
     """
     start_time = time.time()
 
@@ -2465,77 +2615,13 @@ async def upload_docx_to_s3(
     s3_key = s3.upload_docx(doc_name, version, content)
     print(f"  S3 저장 완료: {s3_key}")
 
-    # 2. 파이프라인 실행
-    model_path = resolve_model_path("multilingual-e5-small")
-    embed_model = SentenceTransformer(model_path)
-    filename = f"{doc_name}_v{version}.docx"
-
-    result = process_document(
-        file_path=filename,
-        content=content,
-        doc_id=doc_name,
-        use_llm_metadata=False,
-        embed_model=embed_model,
-    )
-
-    if not result.get("success"):
-        raise HTTPException(400, f"문서 처리 실패: {result.get('errors')}")
-
-    chunks_data = result.get("chunks", [])
-
-    from dataclasses import dataclass
-
-    @dataclass
-    class _Chunk:
-        text: str
-        metadata: dict
-        index: int = 0
-
-    chunks = [_Chunk(text=c["text"], metadata=c["metadata"], index=c["index"]) for c in chunks_data]
-
-    # 3. Weaviate 저장
-    pipeline_version = "pdf-clause-v2.0"
-    texts = [c.text for c in chunks]
-    metadatas = [
-        {**c.metadata, "chunk_method": "article", "model": "multilingual-e5-small", "pipeline_version": pipeline_version}
-        for c in chunks
-    ]
-    vector_store.add_documents(
-        texts=texts, metadatas=metadatas, collection_name=collection, model_name=model_path
-    )
-
-    # 4. PostgreSQL 저장
-    from backend.document_pipeline import docx_to_markdown
-    markdown_text = docx_to_markdown(content)
-
-    doc_id_db = sql_store.save_document(
-        doc_name=doc_name,
-        content=markdown_text,
-        doc_type="docx",
-        version=version,
-    )
-    if doc_id_db and chunks:
-        batch_chunks = [
-            {"clause": c.metadata.get("clause_id"), "content": c.text, "metadata": c.metadata}
-            for c in chunks
-        ]
-        sql_store.save_chunks_batch(doc_id_db, batch_chunks)
-
-    # 5. Neo4j 저장
-    try:
-        graph = get_graph_store()
-        if graph.test_connection():
-            _upload_to_neo4j_from_pipeline(graph, result, filename)
-    except Exception as graph_err:
-        print(f"  Neo4j 저장 실패 (건너뜀): {graph_err}")
-
     elapsed = round(time.time() - start_time, 2)
     return {
         "success": True,
         "doc_name": doc_name,
         "version": version,
         "s3_key": s3_key,
-        "chunks": len(chunks),
+        "processing_mode": "s3_only",
         "elapsed_seconds": elapsed,
     }
 

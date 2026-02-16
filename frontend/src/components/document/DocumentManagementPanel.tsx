@@ -43,16 +43,17 @@ interface DocumentManagementPanelProps {
 export default function DocumentManagementPanel({ onDocumentSelect, onNotify, onOpenInEditor }: DocumentManagementPanelProps) {
   const [groupedDocuments, setGroupedDocuments] = useState<Map<string, FormatGroup>>(new Map());
   const [selectedDoc, setSelectedDoc] = useState<string | null>(null);
+  const [selectedDocs, setSelectedDocs] = useState<Set<string>>(new Set());
   const [versions, setVersions] = useState<Version[]>([]);
   const [isUploadModalOpen, setIsUploadModalOpen] = useState(false);
-  const [uploadFile, setUploadFile] = useState<File | null>(null);
+  const [uploadFiles, setUploadFiles] = useState<File[]>([]);
   const [isUploading, setIsUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<string>('');
   const [isDeleting, setIsDeleting] = useState(false);
   const [docxDocName, setDocxDocName] = useState<string>('');
   const [docxVersion, setDocxVersion] = useState<string>('1.0');
 
-  const isDocxFile = uploadFile?.name.toLowerCase().endsWith('.docx') ?? false;
+  const hasDocxFile = uploadFiles.some((f) => f.name.toLowerCase().endsWith('.docx'));
 
   const normalizeDocType = (docType?: string): string => {
     if (!docType) return 'other';
@@ -173,9 +174,9 @@ export default function DocumentManagementPanel({ onDocumentSelect, onNotify, on
   };
 
   // 문서 클릭 시 최신 버전 내용 바로 표시
-  const handleDocumentSelect = async (docName: string) => {
+  const handleDocumentSelect = async (docName: string, explicitDocType?: string) => {
     setSelectedDoc(docName);
-    const docType = getDocType(docName);
+    const docType = explicitDocType || getDocType(docName);
 
     try {
       const versionResponse = await fetch(`${API_URL}/rag/document/${docName}/versions`);
@@ -210,26 +211,70 @@ export default function DocumentManagementPanel({ onDocumentSelect, onNotify, on
 
   // 문서 삭제 (RDB + Weaviate + Neo4j)
   const handleDeleteDocument = async () => {
-    if (!selectedDoc) return;
-    if (!confirm(`"${selectedDoc}" 문서를 모든 DB에서 삭제하시겠습니까?\n(RDB, VectorDB, GraphDB 전체 삭제)`)) {
+    const targets = selectedDocs.size > 0
+      ? Array.from(selectedDocs)
+      : (selectedDoc ? [selectedDoc] : []);
+    if (targets.length === 0) return;
+
+    const targetText = targets.length === 1
+      ? `"${targets[0]}"`
+      : `${targets.length}개 문서`;
+
+    if (!confirm(`${targetText}를 모든 DB에서 완전 삭제하시겠습니까?\n(RDB, VectorDB, GraphDB 전체 삭제 검증 포함)`)) {
       return;
     }
 
     setIsDeleting(true);
     try {
-      const response = await fetch(`${API_URL}/rag/document`, {
-        method: 'DELETE',
+      const response = await fetch(`${API_URL}/rag/documents/delete-batch`, {
+        method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ doc_name: selectedDoc, collection: 'documents', delete_from_neo4j: true }),
+        body: JSON.stringify({
+          doc_names: targets,
+          collection: 'documents',
+          delete_from_neo4j: true
+        }),
       });
 
       if (response.ok) {
-        alert(`"${selectedDoc}" 삭제 완료`);
-        setSelectedDoc(null);
-        setVersions([]);
+        const data = await response.json();
+        if (data.success) {
+          alert(`선택한 문서 ${targets.length}개 삭제 완료`);
+          if (onNotify) onNotify(`문서 ${targets.length}개 삭제 완료`, 'success');
+        } else {
+          const failed = data.failed_count ?? 0;
+          const failedItems = Array.isArray(data.results)
+            ? data.results.filter((r: any) => !r.success)
+            : [];
+          const failedSummary = failedItems
+            .map((r: any) => {
+              const details = r.details || {};
+              const failedDb = ['rdb', 'weaviate', 'neo4j']
+                .concat('s3_docx')
+                .filter((k) => details[k] && details[k].success === false)
+                .join(',');
+              return `- ${r.doc_name}${failedDb ? ` (${failedDb})` : ''}`;
+            })
+            .join('\n');
+
+          alert(
+            `일부 삭제 실패 (${failed}개 실패)\n` +
+            `${failedSummary || '실패 문서 정보를 확인할 수 없습니다.'}\n\n` +
+            `백엔드 로그에서 [DELETE] 라인도 확인해주세요.`
+          );
+          if (onNotify) onNotify(`일부 삭제 실패 (${failed}개)`, 'error');
+        }
+
+        const removedSet = new Set(targets);
+        if (selectedDoc && removedSet.has(selectedDoc)) {
+          setSelectedDoc(null);
+          setVersions([]);
+        }
+        setSelectedDocs(new Set());
         fetchDocuments();
       } else {
-        alert('삭제 실패');
+        const err = await response.json();
+        alert(`삭제 실패: ${err.detail || '알 수 없는 오류'}`);
       }
     } catch (_error) {
       alert('삭제 중 오류 발생');
@@ -238,62 +283,75 @@ export default function DocumentManagementPanel({ onDocumentSelect, onNotify, on
     }
   };
 
+  const toggleDocChecked = (docId: string) => {
+    setSelectedDocs((prev) => {
+      const next = new Set(prev);
+      if (next.has(docId)) next.delete(docId);
+      else next.add(docId);
+      return next;
+    });
+  };
+
   // 문서 업로드
   const handleUpload = async () => {
-    if (!uploadFile) {
+    if (uploadFiles.length === 0) {
       alert('파일을 선택해주세요.');
       return;
     }
-    if (isDocxFile && !docxDocName.trim()) {
+    if (uploadFiles.length === 1 && hasDocxFile && !docxDocName.trim()) {
       alert('문서 ID를 입력해주세요. (예: EQ-SOP-00001)');
       return;
     }
 
     setIsUploading(true);
-    setUploadProgress('업로드 중...');
-
-    const formData = new FormData();
-    formData.append('file', uploadFile);
+    setUploadProgress(`업로드 중... (0/${uploadFiles.length})`);
 
     try {
-      let response: Response;
+      const failed: string[] = [];
 
-      if (isDocxFile) {
-        // DOCX → S3 저장 + 파이프라인
-        formData.append('doc_name', docxDocName.trim());
-        formData.append('version', docxVersion.trim() || '1.0');
-        formData.append('collection', 'documents');
-        response = await fetch(`${API_URL}/rag/upload-docx`, {
-          method: 'POST',
-          body: formData,
-        });
-      } else {
-        // PDF → 기존 파이프라인
-        formData.append('collection', 'documents');
-        formData.append('use_langgraph', 'true');
-        response = await fetch(`${API_URL}/rag/upload`, {
-          method: 'POST',
-          body: formData,
-        });
-      }
+      for (let i = 0; i < uploadFiles.length; i += 1) {
+        const file = uploadFiles[i];
+        const formData = new FormData();
+        formData.append('file', file);
 
-      if (response.ok) {
-        setUploadProgress('업로드 완료!');
-        if (onNotify) {
-          onNotify('문서 업로드가 완료되었습니다.', 'success');
+        const isDocx = file.name.toLowerCase().endsWith('.docx');
+        setUploadProgress(`업로드 중... (${i + 1}/${uploadFiles.length}) ${file.name}`);
+
+        let response: Response;
+        if (isDocx) {
+          const inferredDocName = file.name.replace(/\.[^.]+$/, '').trim();
+          const targetDocName = (uploadFiles.length === 1 ? docxDocName.trim() : inferredDocName) || inferredDocName;
+          formData.append('doc_name', targetDocName);
+          formData.append('version', docxVersion.trim() || '1.0');
+          formData.append('collection', 'documents');
+          response = await fetch(`${API_URL}/rag/upload-docx`, { method: 'POST', body: formData });
+        } else {
+          formData.append('collection', 'documents');
+          formData.append('use_langgraph', 'true');
+          response = await fetch(`${API_URL}/rag/upload`, { method: 'POST', body: formData });
         }
-        setTimeout(() => {
-          setIsUploadModalOpen(false);
-          setUploadFile(null);
-          setDocxDocName('');
-          setDocxVersion('1.0');
-          setUploadProgress('');
-          fetchDocuments();
-        }, 1500);
-      } else {
-        const err = await response.json();
-        setUploadProgress(`업로드 실패: ${err.detail || '알 수 없는 오류'}`);
+
+        if (!response.ok) {
+          failed.push(file.name);
+        }
       }
+
+      if (failed.length === 0) {
+        setUploadProgress(`업로드 완료! (${uploadFiles.length}개)`);
+        if (onNotify) onNotify(`문서 ${uploadFiles.length}개 업로드 완료`, 'success');
+      } else {
+        setUploadProgress(`일부 업로드 실패 (${failed.length}개): ${failed.join(', ')}`);
+        if (onNotify) onNotify(`일부 업로드 실패 (${failed.length}개)`, 'error');
+      }
+
+      setTimeout(() => {
+        setIsUploadModalOpen(false);
+        setUploadFiles([]);
+        setDocxDocName('');
+        setDocxVersion('1.0');
+        setUploadProgress('');
+        fetchDocuments();
+      }, 1500);
     } catch (error) {
       console.error('업로드 실패:', error);
       setUploadProgress('업로드 중 오류 발생');
@@ -315,10 +373,10 @@ export default function DocumentManagementPanel({ onDocumentSelect, onNotify, on
           <button
             className="bg-dark-border text-txt-primary border-none py-1.5 px-2.5 rounded text-[12px] cursor-pointer transition-colors duration-200 disabled:opacity-40 disabled:cursor-not-allowed hover:enabled:bg-red-700 hover:enabled:text-white"
             onClick={handleDeleteDocument}
-            disabled={!selectedDoc || isDeleting}
-            title={selectedDoc ? `"${selectedDoc}" 삭제` : '문서를 선택하세요'}
+            disabled={(selectedDocs.size === 0 && !selectedDoc) || isDeleting}
+            title={selectedDocs.size > 0 ? `${selectedDocs.size}개 문서 삭제` : (selectedDoc ? `"${selectedDoc}" 삭제` : '문서를 선택하세요')}
           >
-            {isDeleting ? '삭제 중...' : '- 삭제'}
+            {isDeleting ? '삭제 중...' : `- 삭제${selectedDocs.size > 0 ? ` (${selectedDocs.size})` : ''}`}
           </button>
 
           {/* btn-upload */}
@@ -393,10 +451,18 @@ export default function DocumentManagementPanel({ onDocumentSelect, onNotify, on
                                   e.dataTransfer.effectAllowed = 'copy';
                                 }}
                               >
+                                <input
+                                  type="checkbox"
+                                  className="mr-2 accent-[#4ec9b0] cursor-pointer"
+                                  checked={selectedDocs.has(doc.doc_id)}
+                                  onChange={() => toggleDocChecked(doc.doc_id)}
+                                  onClick={(e) => e.stopPropagation()}
+                                  title="삭제 대상 선택"
+                                />
                                 {/* document-info */}
                                 <div
                                   className="flex items-center gap-1.5 text-txt-primary text-[12px] flex-1"
-                                  onClick={() => handleDocumentSelect(doc.doc_id)}
+                                  onClick={() => handleDocumentSelect(doc.doc_id, normalizeDocType(doc.doc_type))}
                                 >
                                   <img
                                     src={docSmallIcon}
@@ -474,13 +540,14 @@ export default function DocumentManagementPanel({ onDocumentSelect, onNotify, on
             <input
               type="file"
               accept=".pdf,.docx"
+              multiple
               className="w-full mb-4 text-txt-primary"
-              onChange={(e) => setUploadFile(e.target.files?.[0] || null)}
+              onChange={(e) => setUploadFiles(Array.from(e.target.files || []))}
               disabled={isUploading}
             />
 
             {/* DOCX 파일일 때 추가 입력 필드 */}
-            {isDocxFile && (
+            {uploadFiles.length === 1 && hasDocxFile && (
               <>
                 <input
                   type="text"
@@ -506,12 +573,18 @@ export default function DocumentManagementPanel({ onDocumentSelect, onNotify, on
               <p className="text-[#4ec9b0] text-[12px] mb-4">{uploadProgress}</p>
             )}
 
+            {uploadFiles.length > 0 && (
+              <p className="text-txt-secondary text-[11px] mb-3">
+                선택된 파일: {uploadFiles.length}개
+              </p>
+            )}
+
             {/* modal-actions */}
             <div className="flex gap-2 justify-end">
               <button
                 className="py-2 px-4 border-none rounded cursor-pointer text-[13px] transition-colors duration-200 bg-accent-blue text-white disabled:opacity-50 disabled:cursor-not-allowed hover:enabled:bg-[#1177bb]"
                 onClick={handleUpload}
-                disabled={isUploading || !uploadFile}
+                disabled={isUploading || uploadFiles.length === 0}
               >
                 업로드
               </button>
@@ -529,4 +602,3 @@ export default function DocumentManagementPanel({ onDocumentSelect, onNotify, on
     </div>
   );
 }
-
