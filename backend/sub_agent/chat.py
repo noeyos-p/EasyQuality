@@ -45,3 +45,4 @@ def chat_agent_node(state: AgentState):
     except Exception as e:
         error_msg = f"대화 처리 중 오류가 발생했습니다: {str(e)} [DONE]"
         return {"context": [error_msg]}
+        

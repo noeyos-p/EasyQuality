@@ -122,14 +122,29 @@ chat_queue: asyncio.Queue = asyncio.Queue()
 chat_pending_ids: List[str] = []
 _graph_store = None
 
+QUEUE_STATE_FILE = "backend/queue_state.json"
+queue_lock = asyncio.Lock()
+
+def load_queue_state():
+    """파일에서 큐 상태를 로드하지 않습니다. (인메모리 전용 모드)"""
+    pass
+
+def save_queue_state():
+    """파일에 큐 상태를 저장하지 않습니다. (인메모리 전용 모드)"""
+    pass
+
 def get_graph_store():
     """Neo4j 그래프 스토어 싱글톤"""
     global _graph_store
-    if _graph_store is None:
-        from backend.graph_store import Neo4jGraphStore
-        _graph_store = Neo4jGraphStore()
-        _graph_store.connect()
-    return _graph_store
+    try:
+        if _graph_store is None:
+            from backend.graph_store import Neo4jGraphStore
+            _graph_store = Neo4jGraphStore()
+            _graph_store.connect()
+        return _graph_store
+    except Exception as e:
+        print(f" 🔴 [Graph Store] 싱글톤 초기화 실패: {e}")
+        return None
 
 #  Document pipeline
 try:
@@ -148,11 +163,20 @@ except ImportError as e:
     LANGGRAPH_AVAILABLE = False
     print(f" Document pipeline 사용 불가: {e}")
 
+try:
+    import langchain
+    LANGCHAIN_AVAILABLE = True
+except ImportError:
+    LANGCHAIN_AVAILABLE = False
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _graph_store
     # Startup
-    print("🚀 채팅 워커(Worker) 가동 중...")
+    # (인메모리 전용 모드: 파일 복구 로직 제거)
+    requeued_count = 0
+
+    print(f"🚀 채팅 워커(Worker) 가동 중... (복구된 작업: {requeued_count}개)")
     worker_task = asyncio.create_task(chat_worker())
 
     yield
@@ -165,10 +189,17 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         print(" 채팅 워커 종료됨")
 
-    vector_store.close_client()
+    try:
+        vector_store.close_client()
+    except Exception as ve:
+        print(f" Weaviate 연결 종료 실패: {ve}")
+
     if _graph_store:
-        _graph_store.close()
-        print(" Neo4j 연결 종료됨")
+        try:
+            _graph_store.close()
+            print(" Neo4j 연결 종료됨")
+        except Exception as ge:
+            print(f" Neo4j 연결 종료 실패: {ge}")
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PDF 변환 유틸리티
@@ -992,20 +1023,29 @@ async def chat_worker():
         request_id, request = await chat_queue.get()
         try:
             print(f" 🚀 [Chat Worker] 처리 시작: {request_id}")
+            
+            # 프로세스 간 상태 동기화
+            load_queue_state()
             chat_results[request_id] = {"status": "processing", "result": None}
-
-            if request_id in chat_pending_ids:
-                chat_pending_ids.remove(request_id)
+            save_queue_state()
 
             result_data = await process_chat_request(request)
+            
+            load_queue_state()
             chat_results[request_id] = {"status": "completed", "result": result_data}
+            save_queue_state()
+            
             print(f" ✅ [Chat Worker] 처리 완료: {request_id}")
         except Exception as e:
             print(f" 🔴 [Chat Worker] 에러: {e}")
+            load_queue_state()
             chat_results[request_id] = {"status": "error", "error": str(e)}
+            save_queue_state()
+        finally:
+            load_queue_state()
             if request_id in chat_pending_ids:
                 chat_pending_ids.remove(request_id)
-        finally:
+            save_queue_state()
             chat_queue.task_done()
 
 def _extract_user_id_from_auth_header(auth_header: Optional[str]) -> Optional[int]:
@@ -1040,8 +1080,15 @@ async def chat(chat_request: ChatRequest, http_request: Request):
 
     print(f" [Agent] 대기열 등록: {request_id} (session: {session_id}, user: {user_id})")
 
-    chat_results[request_id] = {"status": "waiting", "result": None}
+    # 프로세스 간 상태 동기화 및 영속성 저장
+    load_queue_state()
+    chat_results[request_id] = {
+        "status": "waiting",
+        "result": None,
+        "request": queued_request.model_dump() # 복구를 위한 전체 요청 데이터 저장
+    }
     chat_pending_ids.append(request_id)
+    save_queue_state()
 
     await chat_queue.put((request_id, queued_request))
     position = chat_pending_ids.index(request_id) + 1
@@ -1059,12 +1106,19 @@ async def chat(chat_request: ChatRequest, http_request: Request):
 @app.get("/chat/status/{request_id}")
 async def get_chat_status(request_id: str):
     """채팅 작업의 상태와 대기 순번 조회."""
+    # 최신 상태 로드 (다른 프로세스에서 변경했을 수 있음)
+    load_queue_state()
+    
     if request_id not in chat_results:
-        raise HTTPException(404, "요청 ID를 찾을 수 없습니다.")
+        # 캐시에 없으면 한 번 더 로드 시도
+        load_queue_state()
+        if request_id not in chat_results:
+            raise HTTPException(404, "요청 ID를 찾을 수 없습니다.")
 
     status_data = chat_results[request_id].copy()
 
-    if status_data["status"] == "waiting" and request_id in chat_pending_ids:
+    # 대기 중이거나 처리 중인 경우 순번 반환 (인덱스 0 = 처리 중인 작업)
+    if request_id in chat_pending_ids:
         status_data["position"] = chat_pending_ids.index(request_id) + 1
     else:
         status_data.pop("position", None)
@@ -2800,10 +2854,10 @@ def main():
     print(" RAG Chatbot API v14.0 + OpenAI Agent")
     print("=" * 60)
     print(f" LLM 백엔드: OpenAI (GPT-4o-mini)")
-    print(f" 에이전트: {' 활성화' if AGENT_AVAILABLE else ' 비활성화'}")
+    print(f" 에이전트: {' 활성화' if LANGGRAPH_AVAILABLE else ' 비활성화'}")
     
-    if AGENT_AVAILABLE:
-        print(f"   - LangChain: {'' if LANGCHAIN_AVAILABLE else ''}")
+    if LANGGRAPH_AVAILABLE:
+        print(f"   - LangChain: {'활성화' if LANGCHAIN_AVAILABLE else '비활성화'}")
     print("Docs: http://localhost:8000/docs")
     print("=" * 60)
     print("주요 기능:")
