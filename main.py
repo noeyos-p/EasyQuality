@@ -1263,11 +1263,11 @@ def extract_document_category(doc_id: str) -> str:
 
 
 @app.get("/rag/documents")
-def list_documents(collection: str = "documents"):
+async def list_documents(collection: str = "documents"):
     """문서 목록 (RDB에서 조회)"""
     try:
-        # SQL Store에서 모든 문서 조회
-        all_docs = sql_store.get_all_documents()
+        # SQL Store에서 모든 문서 조회 (비동기 처리)
+        all_docs = await asyncio.to_thread(sql_store.get_all_documents)
 
         # 문서별로 그룹화 (같은 문서의 여러 버전)
         docs_dict = {}
@@ -1299,10 +1299,11 @@ def list_documents(collection: str = "documents"):
 
 
 @app.get("/rag/doc-names")
-def list_doc_names():
+async def list_doc_names():
     """모든 문서 이름 목록 조회 (RDB doc_name 테이블)"""
     try:
-        return {"doc_names": sql_store.list_doc_names()}
+        doc_names = await asyncio.to_thread(sql_store.list_doc_names)
+        return {"doc_names": doc_names}
     except Exception as e:
         print(f"문서 이름 목록 조회 실패: {e}")
         return {"doc_names": []}
@@ -1337,10 +1338,10 @@ def get_pdf_presigned_url(doc_name: str, version: Optional[str] = None):
 
 
 @app.get("/rag/document/{doc_name}/versions")
-def get_document_versions(doc_name: str):
+async def get_document_versions(doc_name: str):
     """문서 버전 목록 조회"""
     try:
-        versions = sql_store.get_document_versions(doc_name)
+        versions = await asyncio.to_thread(sql_store.get_document_versions, doc_name)
         if not versions:
             raise HTTPException(404, f"문서를 찾을 수 없습니다: {doc_name}")
         return {
@@ -1355,10 +1356,10 @@ def get_document_versions(doc_name: str):
 
 
 @app.get("/rag/document/{doc_name}/compare")
-def compare_versions(doc_name: str, v1: str, v2: str):
+async def compare_versions(doc_name: str, v1: str, v2: str):
     """두 버전 간의 조항 단위 차이 비교"""
     try:
-        diffs = sql_store.get_clause_diff(doc_name, v1, v2)
+        diffs = await asyncio.to_thread(sql_store.get_clause_diff, doc_name, v1, v2)
 
         # 에러가 있는지 확인
         if diffs and isinstance(diffs[0], dict) and 'error' in diffs[0]:
@@ -1378,11 +1379,11 @@ def compare_versions(doc_name: str, v1: str, v2: str):
 
 
 @app.get("/rag/changes")
-def get_changes(limit: int = 50):
+async def get_changes(limit: int = 50):
     """최근 문서 변경 이력 조회"""
     try:
-        # SQLStore에서 모든 문서를 가져와서 최근 수정순으로 반환
-        all_docs = sql_store.get_all_documents()
+        # SQLStore에서 모든 문서를 가져와서 최근 수정순으로 반환 (비동기 처리)
+        all_docs = await asyncio.to_thread(sql_store.get_all_documents)
         changes = []
         for doc in all_docs[:limit]:
             changes.append({
@@ -1399,15 +1400,15 @@ def get_changes(limit: int = 50):
 
 
 @app.get("/rag/document/{doc_name}/content")
-def get_document_content(doc_name: str, version: Optional[str] = None):
+async def get_document_content(doc_name: str, version: Optional[str] = None):
     """문서 전체 내용 조회"""
     try:
-        doc = sql_store.get_document_by_name(doc_name, version)
+        doc = await asyncio.to_thread(sql_store.get_document_by_name, doc_name, version)
         if not doc:
             raise HTTPException(404, f"문서를 찾을 수 없습니다: {doc_name} (v{version or '최신'})")
 
         # 청크 조회
-        chunks = sql_store.get_chunks_by_document(doc['id'])
+        chunks = await asyncio.to_thread(sql_store.get_chunks_by_document, doc['id'])
 
         return {
             "doc_name": doc_name,
@@ -1425,15 +1426,15 @@ def get_document_content(doc_name: str, version: Optional[str] = None):
 
 
 @app.get("/rag/document/{doc_name}/metadata")
-def get_document_metadata(doc_name: str, version: Optional[str] = None):
+async def get_document_metadata(doc_name: str, version: Optional[str] = None):
     """문서 메타데이터 조회"""
     try:
-        doc = sql_store.get_document_by_name(doc_name, version)
+        doc = await asyncio.to_thread(sql_store.get_document_by_name, doc_name, version)
         if not doc:
             raise HTTPException(404, f"문서를 찾을 수 없습니다: {doc_name}")
 
         # 청크 통계
-        chunks = sql_store.get_chunks_by_document(doc['id'])
+        chunks = await asyncio.to_thread(sql_store.get_chunks_by_document, doc['id'])
 
         # 조항 통계 (메타데이터에서 추출)
         clause_ids = set()
@@ -1759,11 +1760,11 @@ def graph_search_terms(term: str):
 
 
 @app.get("/graph/visualization/all")
-def graph_get_full_visualization():
+async def graph_get_full_visualization():
     """전체 문서 그래프 시각화 데이터 (모든 문서 + 관계)"""
     try:
         graph = get_graph_store()
-        full_graph = graph.get_full_graph()
+        full_graph = await asyncio.to_thread(graph.get_full_graph)
 
         return {
             "success": True,
