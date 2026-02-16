@@ -91,12 +91,15 @@ class SQLStore:
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             users_id INTEGER REFERENCES users(id) ON DELETE SET NULL
         );
+        ALTER TABLE memory ADD COLUMN IF NOT EXISTS session_id TEXT DEFAULT 'default';
+        ALTER TABLE memory ADD COLUMN IF NOT EXISTS embedding VECTOR(384);
 
         -- 인덱스 생성
         CREATE INDEX IF NOT EXISTS idx_chunk_document_id ON chunk(document_id);
         CREATE INDEX IF NOT EXISTS idx_chunk_clause ON chunk(clause);
         CREATE INDEX IF NOT EXISTS idx_chunk_metadata ON chunk USING GIN (metadata);
         CREATE INDEX IF NOT EXISTS idx_memory_users_id ON memory(users_id);
+        CREATE INDEX IF NOT EXISTS idx_memory_users_session ON memory(users_id, session_id);
         CREATE INDEX IF NOT EXISTS idx_document_doc_name_id ON document(doc_name_id);
 
         -- [Migration] doc_name 컬럼이 존재할 경우 삭제 (v2 전환 완료 후)
@@ -533,8 +536,8 @@ class SQLStore:
             return None
 
     # Memory 테이블 관련 메서드
-    def save_memory(self, question: str, answer: str, users_id: int = None, embedding: List[float] = None, session_id: str = "default") -> Optional[int]:
-        """대화 기록 저장"""
+    def save_memory(self, question: str, answer: str, users_id: int, session_id: str, embedding: List[float] = None) -> Optional[int]:
+        """대화 기록 저장 (세션 기반, 세션별 최대 100개 유지)"""
         if embedding:
             insert_query = "INSERT INTO memory (question, answer, users_id, embedding, session_id) VALUES (%s, %s, %s, %s, %s) RETURNING id;"
             params = (question, answer, users_id, embedding, session_id)
@@ -547,6 +550,21 @@ class SQLStore:
                 with conn.cursor() as cur:
                     cur.execute(insert_query, params)
                     memory_id = cur.fetchone()[0]
+
+                    # 세션별 최근 100개만 유지
+                    if users_id and session_id:
+                        delete_query = """
+                            DELETE FROM memory
+                            WHERE id IN (
+                                SELECT id
+                                FROM memory
+                                WHERE users_id = %s AND session_id = %s
+                                ORDER BY created_at DESC
+                                OFFSET 100
+                            );
+                        """
+                        cur.execute(delete_query, (users_id, session_id))
+
                     conn.commit()
             return memory_id
         except Exception as e:
@@ -575,6 +593,32 @@ class SQLStore:
         memories = self.get_memory_by_user(user_id, limit)
         history = []
         # 최신순으로 가져왔으므로 역순으로 정렬하여 시간순으로 배치
+        for mem in reversed(memories):
+            history.append({"role": "user", "content": mem["question"]})
+            history.append({"role": "assistant", "content": mem["answer"]})
+        return history
+
+    def get_memory_by_session(self, users_id: int, session_id: str, limit: int = 10) -> List[Dict]:
+        """사용자 + 세션별 대화 기록 조회"""
+        query = """
+            SELECT id, question, answer, created_at
+            FROM memory
+            WHERE users_id = %s AND session_id = %s
+            ORDER BY created_at DESC
+            LIMIT %s
+        """
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute(query, (users_id, session_id, limit))
+                    return cur.fetchall()
+        except Exception:
+            return []
+
+    def get_conversation_history_by_session(self, user_id: int, session_id: str, limit: int = 10) -> List[Dict]:
+        """세션별 대화 기록 조회 (Agent용 포맷)"""
+        memories = self.get_memory_by_session(user_id, session_id, limit)
+        history = []
         for mem in reversed(memories):
             history.append({"role": "user", "content": mem["question"]})
             history.append({"role": "assistant", "content": mem["answer"]})
@@ -821,6 +865,7 @@ if __name__ == "__main__":
         memory_id = store.save_memory(
             question="품질관리기준서는 어떻게 작성하나요?",
             answer="품질관리기준서는 작성, 검토, 승인 절차를 따릅니다.",
-            users_id=user_id
+            users_id=user_id,
+            session_id="default"
         )
         print(f"생성된 대화 기록 ID: {memory_id}")

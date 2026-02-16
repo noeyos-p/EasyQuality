@@ -714,36 +714,6 @@ def retrieval_agent_node(state: Dict[str, Any]) -> Dict[str, Any]:
     # 참고문헌 섹션 자동 추가
     final_msg_with_refs = _ensure_reference_section(result["messages"], final_msg)
 
-    # ========================================
-    # 검증 (Validation)
-    # ========================================
-    try:
-        from backend.validation import validate_grounding, validate_format
-
-        # Grounding 검증
-        grounding_result = validate_grounding(final_msg, result["messages"])
-        if not grounding_result["valid"]:
-            print(f"🔴 [검색 에이전트 검증 실패 - Grounding]")
-            for error in grounding_result["errors"]:
-                print(f"   {error}")
-            if grounding_result.get("missing_clauses"):
-                print(f"   🔴 누락된 조항: {', '.join(grounding_result['missing_clauses'])}")
-            if grounding_result.get("invalid_citations", 0) > 0:
-                print(f"   🔴 잘못된 인용: {grounding_result['invalid_citations']}개")
-                print(f"   🔴 오류율: {grounding_result.get('error_rate', 0)*100:.1f}%")
-        else:
-            print(f"🟢 [검색 에이전트 검증 통과 - Grounding]")
-
-        # 형식 검증
-        format_result = validate_format(final_msg_with_refs)
-        if not format_result["valid"]:
-            print(f"🔴 [검색 에이전트 검증 실패 - 형식]")
-            for error in format_result["errors"]:
-                print(f"   - {error}")
-
-    except Exception as e:
-        print(f"🔴 [검증 모듈 로드 실패] {e}")
-
     # [중요] 답변 에이전트 도입을 위해 직접 답변하지 않고 context에 보고서 형태로 저장 (리스트 형태로 반환하여 누적)
     report = f"### [검색 에이전트 조사 최종 보고]\n{final_msg_with_refs}"
     return {"context": [report]}

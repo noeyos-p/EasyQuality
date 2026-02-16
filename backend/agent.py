@@ -547,9 +547,22 @@ def run_agent(query: str, session_id: str = "default", model_name: str = None, e
     if not _app:
         _app = create_workflow()
 
+    # main.py -> run_agent(chat_history=...) 전달값 반영
+    chat_history = kwargs.get("chat_history") or []
+    messages = []
+    if isinstance(chat_history, list):
+        for msg in chat_history:
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role")
+            content = msg.get("content")
+            if role in {"system", "user", "assistant"} and content:
+                messages.append({"role": role, "content": str(content)})
+    messages.append({"role": "user", "content": query})
+
     initial_state = {
         "query": query,
-        "messages": [{"role": "user", "content": query}],
+        "messages": messages,
         "next_agent": "orchestrator",
         "worker_model": model_name or "gpt-4o-mini",
         "orchestrator_model": "gpt-4o-mini",

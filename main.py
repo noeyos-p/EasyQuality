@@ -900,16 +900,18 @@ async def process_chat_request(request: ChatRequest) -> Dict:
 
     if user_id:
         try:
-            chat_history = sql_store.get_conversation_history(user_id, limit=6)
-            query_embedding = embed_text(request.message)
-            semantic_memories = sql_store.search_memory_similar(user_id, query_embedding, limit=3)
+            if request.session_id:
+                chat_history = sql_store.get_conversation_history_by_session(
+                    user_id,
+                    request.session_id,
+                    limit=100
+                )
+                print(f"  🧠 [Memory] 사용자 {user_id}, 세션 {request.session_id} 기록 {len(chat_history)}건 로드")
+            else:
+                chat_history = sql_store.get_conversation_history(user_id, limit=10)
+                print(f"  🧠 [Memory] 사용자 {user_id} 최신 기록 {len(chat_history)}건 로드 (세션 미지정)")
 
-            if semantic_memories:
-                memory_block = "\n".join([f"- Q: {m['question']}\n  A: {m['answer']}" for m in semantic_memories])
-                print(f"  🧠 [Memory] 관련 기억 {len(semantic_memories)}건 발견")
-                chat_history = [{"role": "system", "content": f"[관련 과거 기억]\n{memory_block}"}] + chat_history
-
-            print(f"  🧠 [Memory] 사용자 {user_id}의 컨텍스트 로드 완료")
+            print(f"  🧠 [Memory] 사용자 {user_id} 컨텍스트 로드 완료")
         except Exception as e:
             print(f"  ⚠️ [Memory] 조회 실패: {e}")
             import traceback
@@ -925,35 +927,26 @@ async def process_chat_request(request: ChatRequest) -> Dict:
 
     answer = response.get("answer") or ""
 
-    # 롱텀 메모리: 새로운 대화 저장
+    # 롱텀 메모리: 새로운 대화 저장 (세션 기준)
     if user_id and answer:
         try:
-            if query_embedding is None:
-                query_embedding = embed_text(request.message)
+            target_session_id = session_id
 
-            summarized_answer = answer
-            if len(answer) > 200:
-                summary_prompt = f"다음 Q&A를 나중을 위해 핵심만 1~2줄로 요약해줘.\nQ: {request.message}\nA: {answer}\n\n요약 (존댓말):"
-                try:
-                    summarized = get_llm_response(
-                        prompt=summary_prompt,
-                        llm_model="gpt-4o-mini",
-                        llm_backend="openai",
-                        max_tokens=150,
-                        temperature=0.3
-                    )
-                    summarized_answer = summarized.replace("요약:", "").strip()
-                except Exception:
-                    summarized_answer = answer[:500]
+            query_embedding = None
+            try:
+                embed_model = SentenceTransformer("intfloat/multilingual-e5-small")
+                query_embedding = embed_model.encode(request.message).tolist()
+            except Exception as embed_error:
+                print(f"  ⚠️ [Memory] 임베딩 생성 실패: {embed_error}")
 
             sql_store.save_memory(
                 request.message,
-                summarized_answer,
+                answer,
                 user_id,
-                embedding=query_embedding,
-                session_id=session_id
+                target_session_id,
+                embedding=query_embedding
             )
-            print(f"  💾 [Memory] 대화 요약 저장 완료 (길이: {len(summarized_answer)})")
+            print(f"  💾 [Memory] 세션 {target_session_id}에 대화 내용 저장 완료")
         except Exception as e:
             print(f"  ⚠️ [Memory] 저장 실패: {e}")
             import traceback
@@ -1015,22 +1008,48 @@ async def chat_worker():
         finally:
             chat_queue.task_done()
 
+def _extract_user_id_from_auth_header(auth_header: Optional[str]) -> Optional[int]:
+    """Authorization 헤더의 JWT에서 user_id를 추출."""
+    if not auth_header or not auth_header.startswith("Bearer "):
+        return None
+    token = auth_header.split(" ", 1)[1].strip()
+    if not token:
+        return None
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id = payload.get("user_id")
+        return int(user_id) if user_id is not None else None
+    except Exception:
+        return None
+
 
 @app.post("/chat")
-async def chat(request: ChatRequest):
+async def chat(chat_request: ChatRequest, http_request: Request):
     """순차 대기열 채팅 엔드포인트."""
     request_id = str(uuid.uuid4())
-    print(f" [Agent] 대기열 등록: {request_id}")
+    session_id = chat_request.session_id or str(uuid.uuid4())
+    user_id = chat_request.user_id
+    if user_id is None:
+        auth_header = http_request.headers.get("Authorization")
+        user_id = _extract_user_id_from_auth_header(auth_header)
+
+    queued_request = chat_request.model_copy(update={
+        "session_id": session_id,
+        "user_id": user_id
+    })
+
+    print(f" [Agent] 대기열 등록: {request_id} (session: {session_id}, user: {user_id})")
 
     chat_results[request_id] = {"status": "waiting", "result": None}
     chat_pending_ids.append(request_id)
 
-    await chat_queue.put((request_id, request))
+    await chat_queue.put((request_id, queued_request))
     position = chat_pending_ids.index(request_id) + 1
 
     return {
         "success": True,
         "request_id": request_id,
+        "session_id": session_id,
         "message": f"질문이 대기열에 등록되었습니다. (현재 대기 순번: {position}번째)",
         "status": "waiting",
         "position": position

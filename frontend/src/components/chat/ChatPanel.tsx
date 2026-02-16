@@ -202,6 +202,9 @@ export default function ChatPanel({ isVisible, onDocumentSelect }: ChatPanelProp
       if (response.ok) {
         const data = await response.json()
         const requestId = data.request_id
+        if (!sessionId && data.session_id) {
+          setSessionId(data.session_id)
+        }
 
         if (data.position) {
           updateMessage(assistantId, { queuePosition: data.position, status: 'waiting' })
