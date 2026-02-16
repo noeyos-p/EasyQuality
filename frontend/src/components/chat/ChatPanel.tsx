@@ -230,6 +230,9 @@ export default function ChatPanel({ isVisible, onDocumentSelect }: ChatPanelProp
   }
 
   const handleKeyPress = (e: React.KeyboardEvent) => {
+    const isComposing = (e.nativeEvent as KeyboardEvent).isComposing || e.key === 'Process'
+    if (isComposing) return
+
     if (e.key === 'Enter' && !e.shiftKey) {
       if (showSuggestions && suggestions.length > 0) {
         e.preventDefault()
