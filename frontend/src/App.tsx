@@ -9,6 +9,10 @@ import VersionDiffViewer from './components/history/VersionDiffViewer'
 import AuthModal from './components/auth/AuthModal'
 import { useAuth } from './hooks/useAuth'
 import { API_URL } from './types'
+import TaskNotification from './components/layout/TaskNotification'
+import Toast from './components/layout/Toast'
+import type { TaskStatus } from './components/layout/TaskNotification'
+import type { ToastMessage } from './components/layout/Toast'
 
 function App() {
   // 인증 상태
@@ -23,8 +27,7 @@ function App() {
   const [selectedClause, setSelectedClause] = useState<string | null>(null)
   const [documentContent, setDocumentContent] = useState<string | null>(null)
   const [isEditing, setIsEditing] = useState(false)
-  const [editedContent, setEditedContent] = useState<string>('')
-  const [isSaving, setIsSaving] = useState(false)
+  const [editedContent, setEditedContent] = useState('')
 
   // OnlyOffice 에디터 상태
   const [isOnlyOfficeMode, setIsOnlyOfficeMode] = useState(false)
@@ -42,12 +45,65 @@ function App() {
   const [isComparing, setIsComparing] = useState(false)
   const [diffData, setDiffData] = useState<any>(null)
 
+  // 🔄 백그라운드 작업 상태
+  const [activeTasks, setActiveTasks] = useState<TaskStatus[]>([])
+  const [closedTaskIds, setClosedTaskIds] = useState<Set<string>>(new Set())
+  const [refreshCounter, setRefreshCounter] = useState(0)
+
   // 🆕 전역 알림(Toast) 상태
+  const [toasts, setToasts] = useState<ToastMessage[]>([])
+
   const addToast = (message: string, type: 'success' | 'error' | 'info' = 'success') => {
-    // Toast 알림 (콘솔로 대체)
-    console.log(`[${type.toUpperCase()}] ${message}`)
+    const id = Math.random().toString(36).substr(2, 9)
+    setToasts(prev => [...prev, { id, message, type }])
   }
 
+  const removeToast = (id: string) => {
+    setToasts(prev => prev.filter(t => t.id !== id))
+  }
+
+  // 🔄 백그라운드 작업 폴링 (Polling)
+  useEffect(() => {
+    if (!isConnected) return;
+
+    const pollTasks = async () => {
+      try {
+        const res = await fetch(`${API_URL}/processing/list`);
+        if (!res.ok) return;
+        const tasks: TaskStatus[] = await res.json();
+
+        // 필터링: 사용자가 이미 닫은 작업은 제외
+        const visibleTasks = tasks.filter(t => !closedTaskIds.has(t.id));
+
+        // 상태 변경 감지 및 알림
+        tasks.forEach(task => {
+          setActiveTasks(prev => {
+            const prevTask = prev.find(t => t.id === task.id);
+            if (task.status === 'completed' && (!prevTask || prevTask.status !== 'completed')) {
+              addToast(`'${task.filename || task.doc_name || '문서'}' 처리가 완료되었습니다.`, 'success');
+              setRefreshCounter(c => c + 1);
+            } else if (task.status === 'error' && (!prevTask || prevTask.status !== 'error')) {
+              addToast(`'${task.filename || task.doc_name || '문서'}' 처리 중 오류가 발생했습니다.`, 'error');
+            }
+            return visibleTasks; // 항상 최신 목록으로 교체
+          });
+        });
+
+      } catch (err) {
+        console.error('Task polling error:', err);
+      }
+    };
+
+    const interval = setInterval(pollTasks, 3000);
+    pollTasks();
+
+    return () => clearInterval(interval);
+  }, [isConnected, closedTaskIds]);
+
+  const handleCloseTask = (id: string) => {
+    setClosedTaskIds(prev => new Set(prev).add(id));
+    setActiveTasks(prev => prev.filter(t => t.id !== id));
+  };
   // 백엔드 연결 확인
   useEffect(() => {
     const checkBackendStatus = async () => {
@@ -122,9 +178,8 @@ function App() {
       })
 
       if (response.ok) {
-        const data = await response.json()
-        setOnlyOfficeConfig(data.config)
-        setOnlyOfficeServerUrl(data.onlyoffice_server_url)
+        setIsOnlyOfficeMode(true)
+        setOnlyOfficeEditorMode('view')
       } else {
         console.error('OnlyOffice 설정 가져오기 실패')
         setIsOnlyOfficeMode(false)
@@ -146,7 +201,6 @@ function App() {
 
   const handleSaveDocument = async () => {
     if (!selectedDocument) return
-    setIsSaving(true)
     try {
       const response = await fetch(`${API_URL}/rag/document/save`, {
         method: 'POST',
@@ -154,18 +208,14 @@ function App() {
         body: JSON.stringify({ doc_name: selectedDocument, content: editedContent }),
       })
       if (response.ok) {
-        const data = await response.json()
-        setDocumentContent(editedContent)
         setIsEditing(false)
-        alert(`문서가 저장되었습니다. (새 버전: ${data.version})`)
+        addToast(`문서 수정 요청이 접수되었습니다. 백그라운드에서 처리가 진행됩니다.`, 'info')
       } else {
         const errorData = await response.json()
-        alert(`저장 실패: ${errorData.detail || '알 수 없는 오류'}`)
+        addToast(`저장 요청 실패: ${errorData.detail || '알 수 없는 오류'}`, 'error')
       }
     } catch {
-      alert('저장 중 오류가 발생했습니다.')
-    } finally {
-      setIsSaving(false)
+      addToast('저장 중 오류가 발생했습니다.', 'error')
     }
   }
 
@@ -334,6 +384,7 @@ function App() {
               onDocumentSelect={handleDocumentSelect}
               onNotify={addToast}
               onOpenInEditor={handleOpenInEditor}
+              refreshCounter={refreshCounter}
             />
           )}
           {activePanel === 'history' && (
@@ -411,16 +462,9 @@ function App() {
         />
       </div>
 
-      {/* 저장 중 오버레이 */}
-      {isSaving && (
-        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-[2000]">
-          <div className="bg-[#2d2d2d] border border-dark-border rounded-lg p-8 flex flex-col items-center gap-4 text-center">
-            <div className="w-10 h-10 border-4 border-dark-border border-t-accent-blue rounded-full animate-spin"></div>
-            <p className="text-txt-primary text-[14px] m-0">문서를 분석하고 저장하는 중입니다...</p>
-            <span className="text-txt-secondary text-[12px]">이 작업은 최대 1분 정도 소요될 수 있습니다.</span>
-          </div>
-        </div>
-      )}
+      {/* 백그라운드 작업 알림창 및 토스트 */}
+      <Toast toasts={toasts} onRemove={removeToast} />
+      <TaskNotification tasks={activeTasks} onCloseTask={handleCloseTask} />
     </div>
   )
 }

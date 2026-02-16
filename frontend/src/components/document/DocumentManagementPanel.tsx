@@ -38,9 +38,10 @@ interface DocumentManagementPanelProps {
   onDocumentSelect?: (docId: string, docType?: string) => void;
   onNotify?: (message: string, type?: 'success' | 'error' | 'info') => void;
   onOpenInEditor?: (docId: string, version?: string) => void;
+  refreshCounter?: number;
 }
 
-export default function DocumentManagementPanel({ onDocumentSelect, onNotify, onOpenInEditor }: DocumentManagementPanelProps) {
+export default function DocumentManagementPanel({ onDocumentSelect, onNotify, onOpenInEditor, refreshCounter }: DocumentManagementPanelProps) {
   const [groupedDocuments, setGroupedDocuments] = useState<Map<string, FormatGroup>>(new Map());
   const [selectedDoc, setSelectedDoc] = useState<string | null>(null);
   const [selectedDocs, setSelectedDocs] = useState<Set<string>>(new Set());
@@ -72,7 +73,7 @@ export default function DocumentManagementPanel({ onDocumentSelect, onNotify, on
   // 문서 목록 로드
   useEffect(() => {
     fetchDocuments();
-  }, []);
+  }, [refreshCounter]); // refreshCounter 의존성 복구
 
   const fetchDocuments = async () => {
     try {
@@ -337,11 +338,11 @@ export default function DocumentManagementPanel({ onDocumentSelect, onNotify, on
       }
 
       if (failed.length === 0) {
-        setUploadProgress(`업로드 완료! (${uploadFiles.length}개)`);
-        if (onNotify) onNotify(`문서 ${uploadFiles.length}개 업로드 완료`, 'success');
+        setUploadProgress(`업로드 요청 완료! (${uploadFiles.length}개)`);
+        if (onNotify) onNotify(`문서 ${uploadFiles.length}개 업로드 요청이 접수되었습니다. 백그라운드에서 처리가 진행됩니다.`, 'info');
       } else {
-        setUploadProgress(`일부 업로드 실패 (${failed.length}개): ${failed.join(', ')}`);
-        if (onNotify) onNotify(`일부 업로드 실패 (${failed.length}개)`, 'error');
+        setUploadProgress(`일부 요청 실패 (${failed.length}개): ${failed.join(', ')}`);
+        if (onNotify) onNotify(`일부 문서 업로드 요청 실패 (${failed.length}개)`, 'error');
       }
 
       setTimeout(() => {
@@ -350,7 +351,7 @@ export default function DocumentManagementPanel({ onDocumentSelect, onNotify, on
         setDocxDocName('');
         setDocxVersion('1.0');
         setUploadProgress('');
-        fetchDocuments();
+        // 백그라운드 작업이므로 여기서 직접 fetchDocuments()를 호출할 필요는 없음 (polling이 처리)
       }, 1500);
     } catch (error) {
       console.error('업로드 실패:', error);
@@ -403,97 +404,98 @@ export default function DocumentManagementPanel({ onDocumentSelect, onNotify, on
               const formatCount = Array.from(formatGroup.categories.values())
                 .reduce((sum, cg) => sum + cg.documents.length, 0);
               return (
-              <div key={formatGroup.label} className="mb-1">
+                <div key={formatGroup.label} className="mb-1">
 
-                {/* folder-header */}
-                <div
-                  className="flex items-center gap-1.5 py-1.5 px-2 cursor-pointer rounded transition-colors duration-200 select-none hover:bg-dark-hover"
-                  onClick={() => toggleFormatGroup(formatGroup.label)}
-                >
-                  <img
-                    src={docLargeIcon}
-                    alt="folder"
-                    className="w-4 h-4 flex-shrink-0"
-                    style={{ filter: 'brightness(0) invert(0.75)' }}
-                  />
-                  <span className="flex-1 text-[13px] font-semibold text-txt-primary">{formatGroup.label}</span>
-                  <span className="text-[11px] text-txt-secondary">({formatCount})</span>
-                </div>
+                  {/* folder-header */}
+                  <div
+                    className="flex items-center gap-1.5 py-1.5 px-2 cursor-pointer rounded transition-colors duration-200 select-none hover:bg-dark-hover"
+                    onClick={() => toggleFormatGroup(formatGroup.label)}
+                  >
+                    <img
+                      src={docLargeIcon}
+                      alt="folder"
+                      className="w-4 h-4 flex-shrink-0"
+                      style={{ filter: 'brightness(0) invert(0.75)' }}
+                    />
+                    <span className="flex-1 text-[13px] font-semibold text-txt-primary">{formatGroup.label}</span>
+                    <span className="text-[11px] text-txt-secondary">({formatCount})</span>
+                  </div>
 
-                {/* folder-content */}
-                {formatGroup.expanded && (
-                  <div className="ml-5 border-l border-dark-border pl-1">
-                    {Array.from(formatGroup.categories.values()).map((categoryGroup) => (
-                      <div key={`${formatGroup.label}-${categoryGroup.category}`} className="mb-1">
-                        <div
-                          className="flex items-center gap-1.5 py-1.5 px-2 cursor-pointer rounded transition-colors duration-200 select-none hover:bg-dark-hover"
-                          onClick={() => toggleCategoryGroup(formatGroup.label, categoryGroup.category)}
-                        >
-                          <img
-                            src={docLargeIcon}
-                            alt="subfolder"
-                            className="w-3.5 h-3.5 flex-shrink-0"
-                            style={{ filter: 'brightness(0) invert(0.68)' }}
-                          />
-                          <span className="flex-1 text-[12px] font-semibold text-txt-primary">{categoryGroup.category}</span>
-                          <span className="text-[11px] text-txt-secondary">({categoryGroup.documents.length})</span>
-                        </div>
+                  {/* folder-content */}
+                  {formatGroup.expanded && (
+                    <div className="ml-5 border-l border-dark-border pl-1">
+                      {Array.from(formatGroup.categories.values()).map((categoryGroup) => (
+                        <div key={`${formatGroup.label}-${categoryGroup.category}`} className="mb-1">
+                          <div
+                            className="flex items-center gap-1.5 py-1.5 px-2 cursor-pointer rounded transition-colors duration-200 select-none hover:bg-dark-hover"
+                            onClick={() => toggleCategoryGroup(formatGroup.label, categoryGroup.category)}
+                          >
+                            <img
+                              src={docLargeIcon}
+                              alt="subfolder"
+                              className="w-3.5 h-3.5 flex-shrink-0"
+                              style={{ filter: 'brightness(0) invert(0.68)' }}
+                            />
+                            <span className="flex-1 text-[12px] font-semibold text-txt-primary">{categoryGroup.category}</span>
+                            <span className="text-[11px] text-txt-secondary">({categoryGroup.documents.length})</span>
+                          </div>
 
-                        {categoryGroup.expanded && (
-                          <div className="ml-4 border-l border-dark-border pl-1">
-                            {categoryGroup.documents.map((doc, idx) => (
-                              <div
-                                key={`${doc.doc_id}-${idx}`}
-                                className={`flex items-center py-1.5 px-2 rounded cursor-pointer transition-colors duration-200 hover:bg-dark-hover ${selectedDoc === doc.doc_id ? 'bg-dark-active' : ''}`}
-                                draggable={true}
-                                onDragStart={(e) => {
-                                  e.dataTransfer.setData('text/plain', doc.doc_id);
-                                  e.dataTransfer.effectAllowed = 'copy';
-                                }}
-                              >
-                                <input
-                                  type="checkbox"
-                                  className="mr-2 accent-[#4ec9b0] cursor-pointer"
-                                  checked={selectedDocs.has(doc.doc_id)}
-                                  onChange={() => toggleDocChecked(doc.doc_id)}
-                                  onClick={(e) => e.stopPropagation()}
-                                  title="삭제 대상 선택"
-                                />
-                                {/* document-info */}
+                          {categoryGroup.expanded && (
+                            <div className="ml-4 border-l border-dark-border pl-1">
+                              {categoryGroup.documents.map((doc, idx) => (
                                 <div
-                                  className="flex items-center gap-1.5 text-txt-primary text-[12px] flex-1"
-                                  onClick={() => handleDocumentSelect(doc.doc_id, normalizeDocType(doc.doc_type))}
+                                  key={`${doc.doc_id}-${idx}`}
+                                  className={`flex items-center py-1.5 px-2 rounded cursor-pointer transition-colors duration-200 hover:bg-dark-hover ${selectedDoc === doc.doc_id ? 'bg-dark-active' : ''}`}
+                                  draggable={true}
+                                  onDragStart={(e) => {
+                                    e.dataTransfer.setData('text/plain', doc.doc_id);
+                                    e.dataTransfer.effectAllowed = 'copy';
+                                  }}
                                 >
-                                  <img
-                                    src={docSmallIcon}
-                                    alt="document"
-                                    className="w-3.5 h-3.5 flex-shrink-0"
-                                    style={{ filter: 'brightness(0) invert(0.7)' }}
+                                  <input
+                                    type="checkbox"
+                                    className="mr-2 accent-[#4ec9b0] cursor-pointer"
+                                    checked={selectedDocs.has(doc.doc_id)}
+                                    onChange={() => toggleDocChecked(doc.doc_id)}
+                                    onClick={(e) => e.stopPropagation()}
+                                    title="삭제 대상 선택"
                                   />
-                                  <span>{doc.doc_id}</span>
-                                  {doc.chunk_count && (
-                                    <span className="text-txt-secondary text-[11px] ml-1">({doc.chunk_count}개)</span>
+                                  {/* document-info */}
+                                  <div
+                                    className="flex items-center gap-1.5 text-txt-primary text-[12px] flex-1"
+                                    onClick={() => handleDocumentSelect(doc.doc_id, normalizeDocType(doc.doc_type))}
+                                  >
+                                    <img
+                                      src={docSmallIcon}
+                                      alt="document"
+                                      className="w-3.5 h-3.5 flex-shrink-0"
+                                      style={{ filter: 'brightness(0) invert(0.7)' }}
+                                    />
+                                    <span>{doc.doc_id}</span>
+                                    {doc.chunk_count && (
+                                      <span className="text-txt-secondary text-[11px] ml-1">({doc.chunk_count}개)</span>
+                                    )}
+                                  </div>
+                                  {normalizeDocType(doc.doc_type) === 'docx' && onOpenInEditor && (
+                                    <button
+                                      className="ml-1 bg-transparent border border-dark-border text-[#4ec9b0] text-[10px] py-0.5 px-1.5 rounded cursor-pointer transition-all duration-200 hover:bg-dark-border hover:text-white flex-shrink-0"
+                                      onClick={(e) => { e.stopPropagation(); onOpenInEditor(doc.doc_id, doc.version) }}
+                                      title="OnlyOffice 에디터에서 열기"
+                                    >
+                                      편집
+                                    </button>
                                   )}
                                 </div>
-                                {normalizeDocType(doc.doc_type) === 'docx' && onOpenInEditor && (
-                                  <button
-                                    className="ml-1 bg-transparent border border-dark-border text-[#4ec9b0] text-[10px] py-0.5 px-1.5 rounded cursor-pointer transition-all duration-200 hover:bg-dark-border hover:text-white flex-shrink-0"
-                                    onClick={(e) => { e.stopPropagation(); onOpenInEditor(doc.doc_id, doc.version) }}
-                                    title="OnlyOffice 에디터에서 열기"
-                                  >
-                                    편집
-                                  </button>
-                                )}
-                              </div>
-                            ))}
-                          </div>
-                        )}
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            )})
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )
+            })
           )}
         </div>
 

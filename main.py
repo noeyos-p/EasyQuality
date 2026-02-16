@@ -2593,36 +2593,126 @@ class OnlyOfficeConfigRequest(BaseModel):
     mode: str = "view"
 
 
+async def process_docx_upload_task(
+    content: bytes,
+    doc_name: str,
+    version: str,
+    collection: str,
+    task_id: str
+):
+    """DOCX 업로드 및 RAG 파이프라인 백그라운드 작업"""
+    start_time = time.time()
+    update_task_status(task_id, "processing", f"'{doc_name}' DOCX 파일을 분석 중입니다.")
+    
+    try:
+        # 1. S3 저장
+        s3 = get_s3_store()
+        s3_key = await asyncio.to_thread(s3.upload_docx, doc_name, version, content)
+        
+        # 2. 파이프라인 실행
+        model_path = resolve_model_path("multilingual-e5-small")
+        embed_model = SentenceTransformer(model_path)
+        filename = f"{doc_name}_v{version}.docx"
+
+        result = await asyncio.to_thread(
+            process_document,
+            file_path=filename,
+            content=content,
+            doc_id=doc_name,
+            use_llm_metadata=False,
+            embed_model=embed_model,
+        )
+
+        if not result.get("success"):
+            raise Exception(f"문서 처리 실패: {result.get('errors')}")
+
+        chunks_data = result.get("chunks", [])
+        
+        @dataclass
+        class _Chunk:
+            text: str
+            metadata: dict
+            index: int = 0
+
+        chunks = [_Chunk(text=c["text"], metadata=c["metadata"], index=c["index"]) for c in chunks_data]
+        update_task_status(task_id, "processing", f"DOCX 파싱 완료 (청크 {len(chunks)}개). DB 저장 중...")
+
+        # 3. Weaviate 저장
+        pipeline_version = "pdf-clause-v2.0"
+        texts = [c.text for c in chunks]
+        metadatas = [
+            {**c.metadata, "chunk_method": "article", "model": "multilingual-e5-small", "pipeline_version": pipeline_version}
+            for c in chunks
+        ]
+        await asyncio.to_thread(vector_store.add_documents, texts=texts, metadatas=metadatas, collection_name=collection, model_name=model_path)
+
+        # 4. PostgreSQL 저장
+        from backend.document_pipeline import docx_to_markdown
+        markdown_text = await asyncio.to_thread(docx_to_markdown, content)
+
+        doc_id_db = await asyncio.to_thread(
+            sql_store.save_document,
+            doc_name=doc_name,
+            content=markdown_text,
+            doc_type="docx",
+            version=version,
+        )
+        if doc_id_db and chunks:
+            batch_chunks = [
+                {"clause": c.metadata.get("clause_id"), "content": c.text, "metadata": c.metadata}
+                for c in chunks
+            ]
+            await asyncio.to_thread(sql_store.save_chunks_batch, doc_id_db, batch_chunks)
+
+        # 5. Neo4j 저장
+        try:
+            graph = get_graph_store()
+            if graph and graph.test_connection():
+                await asyncio.to_thread(_upload_to_neo4j_from_pipeline, graph, result, filename)
+        except Exception as graph_err:
+            print(f"  Neo4j 저장 실패 (건너뜀): {graph_err}")
+
+        elapsed = round(time.time() - start_time, 2)
+        update_task_status(task_id, "completed", f"DOCX 적재가 완료되었습니다. ({elapsed}초)", doc_name=doc_name, version=version, s3_key=s3_key)
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        update_task_status(task_id, "error", f"DOCX 처리 중 오류 발생: {str(e)}")
+
+
 @app.post("/rag/upload-docx")
 async def upload_docx_to_s3(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     doc_name: str = Form(...),
     version: str = Form("1.0"),
     collection: str = Form("documents"),
 ):
     """
-    DOCX 파일을 S3에만 저장 (파싱/인덱싱 생략)
+    DOCX 파일을 S3에 저장 후 RAG 파이프라인 실행 (비동기)
     """
-    start_time = time.time()
-
     if not file.filename.lower().endswith('.docx'):
         raise HTTPException(400, "DOCX 파일만 업로드 가능합니다.")
 
     content = await file.read()
+    task_id = f"docx_{uuid.uuid4().hex[:8]}"
+    update_task_status(task_id, "waiting", f"'{doc_name}' DOCX 업로드 요청이 접수되었습니다.", doc_name=doc_name)
 
-    # 1. S3 저장
-    s3 = get_s3_store()
-    s3_key = s3.upload_docx(doc_name, version, content)
-    print(f"  S3 저장 완료: {s3_key}")
+    background_tasks.add_task(
+        process_docx_upload_task,
+        content=content,
+        doc_name=doc_name,
+        version=version,
+        collection=collection,
+        task_id=task_id
+    )
 
-    elapsed = round(time.time() - start_time, 2)
     return {
         "success": True,
-        "doc_name": doc_name,
-        "version": version,
-        "s3_key": s3_key,
-        "processing_mode": "s3_only",
-        "elapsed_seconds": elapsed,
+        "message": "DOCX 업로드 및 분석이 시작되었습니다.",
+        "task_id": task_id,
+        "doc_name": doc_name
     }
 
 
@@ -2745,6 +2835,9 @@ async def onlyoffice_callback(request: Request):
         # key 형식: {doc_id}_v{version}_{timestamp}
         parts = key.split('_v')
         doc_id = parts[0] if len(parts) > 1 else key
+        
+        task_id = f"onlyoffice_{doc_id}_{int(time.time())}"
+        update_task_status(task_id, "processing", f"'{doc_id}' OnlyOffice 편집본을 저장 중입니다.", doc_name=doc_id)
         version_part = parts[1].rsplit('_', 1)[0] if len(parts) > 1 else '1.0'
 
         # 새 버전 번호 결정 (현재 버전 + 0.1)
@@ -2829,12 +2922,16 @@ async def onlyoffice_callback(request: Request):
         except Exception as graph_err:
             print(f"  Neo4j 저장 실패 (건너뜀): {graph_err}")
 
+        elapsed = round(time.time() - start_time, 2)
+        update_task_status(task_id, "completed", f"OnlyOffice 편집본 저장이 완료되었습니다. ({elapsed}초)", doc_id=doc_id, version=new_version)
         print(f"  [OnlyOffice Callback] 완료 - 새 버전 {new_version} 저장됨")
         return {"error": 0}
 
     except Exception as e:
         import traceback
         traceback.print_exc()
+        if 'task_id' in locals():
+            update_task_status(task_id, "error", f"OnlyOffice 저장 실패: {str(e)}")
         print(f"  [OnlyOffice Callback] 오류: {e}")
         # OnlyOffice는 error: 0이 아니면 재시도하므로 항상 0 반환
         return {"error": 0}

@@ -5,23 +5,23 @@ export default {
     extend: {
       colors: {
         dark: {
-          bg:      '#1F1F1F',
-          deeper:  '#181818',
-          light:   '#252526',
-          hover:   '#2a2d2e',
-          border:  '#3e3e42',
-          active:  '#37373d',
+          bg: '#1F1F1F',
+          deeper: '#181818',
+          light: '#252526',
+          hover: '#2a2d2e',
+          border: '#3e3e42',
+          active: '#37373d',
         },
         txt: {
-          primary:   '#cccccc',
+          primary: '#cccccc',
           secondary: '#858585',
-          muted:     '#6a6a6a',
-          white:     '#ffffff',
+          muted: '#6a6a6a',
+          white: '#ffffff',
         },
         accent: {
           DEFAULT: '#22D142',
-          hover:   '#1ab835',
-          blue:    '#007acc',
+          hover: '#1ab835',
+          blue: '#007acc',
         },
       },
       fontFamily: {
