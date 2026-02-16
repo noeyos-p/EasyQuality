@@ -9,6 +9,7 @@ interface Document {
   doc_title?: string;
   doc_category?: string;
   doc_type?: string;
+  doc_format?: string;
   chunk_count?: number;
   model?: string;
   collection?: string;
@@ -19,6 +20,13 @@ interface DocumentGroup {
   category: string;
   documents: Document[];
   expanded: boolean;
+}
+
+interface FormatGroup {
+  format: string;
+  label: string;
+  expanded: boolean;
+  categories: Map<string, DocumentGroup>;
 }
 
 interface Version {
@@ -33,7 +41,7 @@ interface DocumentManagementPanelProps {
 }
 
 export default function DocumentManagementPanel({ onDocumentSelect, onNotify, onOpenInEditor }: DocumentManagementPanelProps) {
-  const [groupedDocuments, setGroupedDocuments] = useState<Map<string, DocumentGroup>>(new Map());
+  const [groupedDocuments, setGroupedDocuments] = useState<Map<string, FormatGroup>>(new Map());
   const [selectedDoc, setSelectedDoc] = useState<string | null>(null);
   const [versions, setVersions] = useState<Version[]>([]);
   const [isUploadModalOpen, setIsUploadModalOpen] = useState(false);
@@ -45,6 +53,20 @@ export default function DocumentManagementPanel({ onDocumentSelect, onNotify, on
   const [docxVersion, setDocxVersion] = useState<string>('1.0');
 
   const isDocxFile = uploadFile?.name.toLowerCase().endsWith('.docx') ?? false;
+
+  const normalizeDocType = (docType?: string): string => {
+    if (!docType) return 'other';
+    const t = docType.toLowerCase();
+    if (t.includes('pdf')) return 'pdf';
+    if (t.includes('docx')) return 'docx';
+    return 'other';
+  };
+
+  const getFormatFolderLabel = (format: string): string => {
+    if (format === 'pdf') return 'PDF';
+    if (format === 'docx') return 'DOCX';
+    return '기타';
+  };
 
   // 문서 목록 로드
   useEffect(() => {
@@ -58,27 +80,53 @@ export default function DocumentManagementPanel({ onDocumentSelect, onNotify, on
       console.log('🔍 [Documents API Response]', data);
       const docs = data.documents || [];
 
-      // 문서를 카테고리별로 그룹화
-      const groups = new Map<string, DocumentGroup>();
+      // 문서를 포맷(PDF/DOCX/기타) > 카테고리(SOP/WI/FRM/기타) 2단계로 그룹화
+      const groups = new Map<string, FormatGroup>();
       docs.forEach((doc: Document) => {
-        const category = doc.doc_category || '기타';
-        if (!groups.has(category)) {
-          groups.set(category, {
-            category,
-            documents: [],
-            expanded: true, // 기본적으로 펼쳐진 상태
+        const format = (doc.doc_format || normalizeDocType(doc.doc_type)).toLowerCase();
+        const formatLabel = getFormatFolderLabel(format);
+        if (!groups.has(formatLabel)) {
+          groups.set(formatLabel, {
+            format,
+            label: formatLabel,
+            expanded: true,
+            categories: new Map<string, DocumentGroup>(),
           });
         }
-        groups.get(category)!.documents.push(doc);
+
+        const formatGroup = groups.get(formatLabel)!;
+        const category = doc.doc_category || '기타';
+        if (!formatGroup.categories.has(category)) {
+          formatGroup.categories.set(category, {
+            category,
+            documents: [],
+            expanded: true,
+          });
+        }
+        formatGroup.categories.get(category)!.documents.push(doc);
       });
 
-      // 카테고리 순서: SOP > WI > FRM > 기타
-      const sortedGroups = new Map(
-        Array.from(groups.entries()).sort((a, b) => {
-          const order = ['SOP', 'WI', 'FRM', '기타'];
+      // 정렬: 포맷(PDF > DOCX > 기타), 카테고리(SOP > WI > FRM > 기타)
+      const sortedGroups = new Map<string, FormatGroup>();
+      Array.from(groups.entries())
+        .sort((a, b) => {
+          const order = ['PDF', 'DOCX', '기타'];
           return order.indexOf(a[0]) - order.indexOf(b[0]);
         })
-      );
+        .forEach(([key, formatGroup]) => {
+          const sortedCategories = new Map(
+            Array.from(formatGroup.categories.entries()).sort((a, b) => {
+              const order = ['SOP', 'WI', 'FRM', '기타'];
+              const ia = order.indexOf(a[0]);
+              const ib = order.indexOf(b[0]);
+              if (ia === -1 && ib === -1) return a[0].localeCompare(b[0]);
+              if (ia === -1) return 1;
+              if (ib === -1) return -1;
+              return ia - ib;
+            })
+          );
+          sortedGroups.set(key, { ...formatGroup, categories: sortedCategories });
+        });
 
       setGroupedDocuments(sortedGroups);
     } catch (error) {
@@ -86,22 +134,40 @@ export default function DocumentManagementPanel({ onDocumentSelect, onNotify, on
     }
   };
 
-  const toggleGroup = (category: string) => {
+  const toggleFormatGroup = (formatLabel: string) => {
     setGroupedDocuments((prev) => {
       const newGroups = new Map(prev);
-      const group = newGroups.get(category);
+      const group = newGroups.get(formatLabel);
       if (group) {
-        newGroups.set(category, { ...group, expanded: !group.expanded });
+        newGroups.set(formatLabel, { ...group, expanded: !group.expanded });
       }
+      return newGroups;
+    });
+  };
+
+  const toggleCategoryGroup = (formatLabel: string, category: string) => {
+    setGroupedDocuments((prev) => {
+      const newGroups = new Map(prev);
+      const formatGroup = newGroups.get(formatLabel);
+      if (!formatGroup) return newGroups;
+
+      const newCategories = new Map(formatGroup.categories);
+      const catGroup = newCategories.get(category);
+      if (catGroup) {
+        newCategories.set(category, { ...catGroup, expanded: !catGroup.expanded });
+      }
+      newGroups.set(formatLabel, { ...formatGroup, categories: newCategories });
       return newGroups;
     });
   };
 
   // docId로 doc_type 조회
   const getDocType = (docId: string): string | undefined => {
-    for (const group of groupedDocuments.values()) {
-      const doc = group.documents.find(d => d.doc_id === docId);
-      if (doc) return doc.doc_type;
+    for (const formatGroup of groupedDocuments.values()) {
+      for (const categoryGroup of formatGroup.categories.values()) {
+        const doc = categoryGroup.documents.find((d) => d.doc_id === docId);
+        if (doc) return normalizeDocType(doc.doc_type);
+      }
     }
     return undefined;
   };
@@ -275,13 +341,16 @@ export default function DocumentManagementPanel({ onDocumentSelect, onNotify, on
           {groupedDocuments.size === 0 ? (
             <p className="text-txt-secondary text-[12px] p-2 text-center">문서가 없습니다.</p>
           ) : (
-            Array.from(groupedDocuments.values()).map((group) => (
-              <div key={group.category} className="mb-1">
+            Array.from(groupedDocuments.values()).map((formatGroup) => {
+              const formatCount = Array.from(formatGroup.categories.values())
+                .reduce((sum, cg) => sum + cg.documents.length, 0);
+              return (
+              <div key={formatGroup.label} className="mb-1">
 
                 {/* folder-header */}
                 <div
                   className="flex items-center gap-1.5 py-1.5 px-2 cursor-pointer rounded transition-colors duration-200 select-none hover:bg-dark-hover"
-                  onClick={() => toggleGroup(group.category)}
+                  onClick={() => toggleFormatGroup(formatGroup.label)}
                 >
                   <img
                     src={docLargeIcon}
@@ -289,54 +358,76 @@ export default function DocumentManagementPanel({ onDocumentSelect, onNotify, on
                     className="w-4 h-4 flex-shrink-0"
                     style={{ filter: 'brightness(0) invert(0.75)' }}
                   />
-                  <span className="flex-1 text-[13px] font-semibold text-txt-primary">{group.category}</span>
-                  <span className="text-[11px] text-txt-secondary">({group.documents.length})</span>
+                  <span className="flex-1 text-[13px] font-semibold text-txt-primary">{formatGroup.label}</span>
+                  <span className="text-[11px] text-txt-secondary">({formatCount})</span>
                 </div>
 
                 {/* folder-content */}
-                {group.expanded && (
+                {formatGroup.expanded && (
                   <div className="ml-5 border-l border-dark-border pl-1">
-                    {group.documents.map((doc, idx) => (
-                      <div
-                        key={idx}
-                        className={`flex items-center py-1.5 px-2 rounded cursor-pointer transition-colors duration-200 hover:bg-dark-hover ${selectedDoc === doc.doc_id ? 'bg-dark-active' : ''}`}
-                        draggable={true}
-                        onDragStart={(e) => {
-                          e.dataTransfer.setData('text/plain', doc.doc_id);
-                          e.dataTransfer.effectAllowed = 'copy';
-                        }}
-                      >
-                        {/* document-info */}
+                    {Array.from(formatGroup.categories.values()).map((categoryGroup) => (
+                      <div key={`${formatGroup.label}-${categoryGroup.category}`} className="mb-1">
                         <div
-                          className="flex items-center gap-1.5 text-txt-primary text-[12px] flex-1"
-                          onClick={() => handleDocumentSelect(doc.doc_id)}
+                          className="flex items-center gap-1.5 py-1.5 px-2 cursor-pointer rounded transition-colors duration-200 select-none hover:bg-dark-hover"
+                          onClick={() => toggleCategoryGroup(formatGroup.label, categoryGroup.category)}
                         >
                           <img
-                            src={docSmallIcon}
-                            alt="document"
+                            src={docLargeIcon}
+                            alt="subfolder"
                             className="w-3.5 h-3.5 flex-shrink-0"
-                            style={{ filter: 'brightness(0) invert(0.7)' }}
+                            style={{ filter: 'brightness(0) invert(0.68)' }}
                           />
-                          <span>{doc.doc_id}</span>
-                          {doc.chunk_count && (
-                            <span className="text-txt-secondary text-[11px] ml-1">({doc.chunk_count}개)</span>
-                          )}
+                          <span className="flex-1 text-[12px] font-semibold text-txt-primary">{categoryGroup.category}</span>
+                          <span className="text-[11px] text-txt-secondary">({categoryGroup.documents.length})</span>
                         </div>
-                        {doc.doc_type === 'docx' && onOpenInEditor && (
-                          <button
-                            className="ml-1 bg-transparent border border-dark-border text-[#4ec9b0] text-[10px] py-0.5 px-1.5 rounded cursor-pointer transition-all duration-200 hover:bg-dark-border hover:text-white flex-shrink-0"
-                            onClick={(e) => { e.stopPropagation(); onOpenInEditor(doc.doc_id, doc.version) }}
-                            title="OnlyOffice 에디터에서 열기"
-                          >
-                            편집
-                          </button>
+
+                        {categoryGroup.expanded && (
+                          <div className="ml-4 border-l border-dark-border pl-1">
+                            {categoryGroup.documents.map((doc, idx) => (
+                              <div
+                                key={`${doc.doc_id}-${idx}`}
+                                className={`flex items-center py-1.5 px-2 rounded cursor-pointer transition-colors duration-200 hover:bg-dark-hover ${selectedDoc === doc.doc_id ? 'bg-dark-active' : ''}`}
+                                draggable={true}
+                                onDragStart={(e) => {
+                                  e.dataTransfer.setData('text/plain', doc.doc_id);
+                                  e.dataTransfer.effectAllowed = 'copy';
+                                }}
+                              >
+                                {/* document-info */}
+                                <div
+                                  className="flex items-center gap-1.5 text-txt-primary text-[12px] flex-1"
+                                  onClick={() => handleDocumentSelect(doc.doc_id)}
+                                >
+                                  <img
+                                    src={docSmallIcon}
+                                    alt="document"
+                                    className="w-3.5 h-3.5 flex-shrink-0"
+                                    style={{ filter: 'brightness(0) invert(0.7)' }}
+                                  />
+                                  <span>{doc.doc_id}</span>
+                                  {doc.chunk_count && (
+                                    <span className="text-txt-secondary text-[11px] ml-1">({doc.chunk_count}개)</span>
+                                  )}
+                                </div>
+                                {normalizeDocType(doc.doc_type) === 'docx' && onOpenInEditor && (
+                                  <button
+                                    className="ml-1 bg-transparent border border-dark-border text-[#4ec9b0] text-[10px] py-0.5 px-1.5 rounded cursor-pointer transition-all duration-200 hover:bg-dark-border hover:text-white flex-shrink-0"
+                                    onClick={(e) => { e.stopPropagation(); onOpenInEditor(doc.doc_id, doc.version) }}
+                                    title="OnlyOffice 에디터에서 열기"
+                                  >
+                                    편집
+                                  </button>
+                                )}
+                              </div>
+                            ))}
+                          </div>
                         )}
                       </div>
                     ))}
                   </div>
                 )}
               </div>
-            ))
+            )})
           )}
         </div>
 
@@ -438,3 +529,4 @@ export default function DocumentManagementPanel({ onDocumentSelect, onNotify, on
     </div>
   );
 }
+

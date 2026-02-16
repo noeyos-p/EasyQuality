@@ -537,42 +537,171 @@ class Neo4jGraphStore:
                 "relationships": record["rels"] or 0
             }
 
-    def get_full_graph(self) -> Dict:
-        """전체 문서 그래프 가져오기 (시각화용)"""
+    def get_full_graph(self, include_sections: bool = False, doc_id: Optional[str] = None) -> Dict:
+        """전체 문서 그래프 가져오기 (시각화용)
+
+        Args:
+            include_sections: True면 Section 노드/관계까지 포함
+            doc_id: include_sections=True일 때 특정 문서 섹션만 포함하고 싶을 때 사용
+        """
         with self.driver.session(database=self.database) as session:
-            # 모든 Document 노드 가져오기
-            nodes_result = session.run("""
-                MATCH (d:Document)
-                OPTIONAL MATCH (d)-[:IS_TYPE]->(dt:DocumentType)
-                RETURN d.doc_id as id, d.title as title, d.version as version,
-                       dt.code as doc_type, dt.name_kr as type_name
-            """)
+            # 모든 Document 노드 가져오기 (doc_id 필터가 있으면 기준 문서 + 직접 연결 문서만)
+            if doc_id:
+                nodes_result = session.run("""
+                    MATCH (d:Document {doc_id: $doc_id})
+                    OPTIONAL MATCH (d)-[:REFERENCES|HAS_SECTION|MENTIONS*1..2]-(linked:Document)
+                    WITH collect(DISTINCT d) + collect(DISTINCT linked) as docs
+                    UNWIND docs as doc
+                    OPTIONAL MATCH (doc)-[:IS_TYPE]->(dt:DocumentType)
+                    RETURN DISTINCT doc.doc_id as id, doc.title as title, doc.version as version,
+                           dt.code as doc_type, dt.name_kr as type_name
+                """, doc_id=doc_id)
+            else:
+                nodes_result = session.run("""
+                    MATCH (d:Document)
+                    OPTIONAL MATCH (d)-[:IS_TYPE]->(dt:DocumentType)
+                    RETURN d.doc_id as id, d.title as title, d.version as version,
+                           dt.code as doc_type, dt.name_kr as type_name
+                """)
 
             nodes = []
+            node_ids = set()
             for record in nodes_result:
-                nodes.append({
+                node = {
                     "id": record["id"],
+                    "kind": "document",
                     "title": record["title"],
                     "version": record["version"],
                     "doc_type": record["doc_type"],
                     "type_name": record["type_name"]
-                })
+                }
+                nodes.append(node)
+                node_ids.add(record["id"])
 
             # 모든 REFERENCES와 MENTIONS 관계 가져오기
-            links_result = session.run("""
-                MATCH (d1:Document)-[:REFERENCES]->(d2:Document)
-                RETURN DISTINCT d1.doc_id as source, d2.doc_id as target
-                UNION
-                MATCH (d1:Document)-[:HAS_SECTION]->(s:Section)-[:MENTIONS]->(d2:Document)
-                RETURN DISTINCT d1.doc_id as source, d2.doc_id as target
-            """)
+            if doc_id:
+                links_result = session.run("""
+                    MATCH (d:Document {doc_id: $doc_id})
+                    OPTIONAL MATCH (d)-[:REFERENCES]->(to_doc:Document)
+                    WITH d, collect(DISTINCT {source: d.doc_id, target: to_doc.doc_id, type: 'REFERENCES'}) as refs
+                    OPTIONAL MATCH (d)-[:HAS_SECTION]->(:Section)-[:MENTIONS]->(mentioned:Document)
+                    WITH refs + collect(DISTINCT {source: d.doc_id, target: mentioned.doc_id, type: 'MENTIONS_DOC'}) as rels
+                    UNWIND rels as rel
+                    RETURN rel.source as source, rel.target as target, rel.type as type
+                """, doc_id=doc_id)
+            else:
+                links_result = session.run("""
+                    MATCH (d1:Document)-[:REFERENCES]->(d2:Document)
+                    RETURN DISTINCT d1.doc_id as source, d2.doc_id as target, 'REFERENCES' as type
+                    UNION
+                    MATCH (d1:Document)-[:HAS_SECTION]->(s:Section)-[:MENTIONS]->(d2:Document)
+                    RETURN DISTINCT d1.doc_id as source, d2.doc_id as target, 'MENTIONS_DOC' as type
+                """)
 
             links = []
+            seen_links = set()
             for record in links_result:
+                if not record["source"] or not record["target"]:
+                    continue
+                key = (record["source"], record["target"], record["type"])
+                if key in seen_links:
+                    continue
+                seen_links.add(key)
                 links.append({
                     "source": record["source"],
-                    "target": record["target"]
+                    "target": record["target"],
+                    "type": record["type"],
                 })
+
+            # Section 노드/관계 확장
+            if include_sections:
+                # 문서-문서 연결에 실제로 기여하는 섹션(MENTIONS 보유)만 포함
+                if doc_id:
+                    section_nodes_result = session.run("""
+                        MATCH (d:Document {doc_id: $doc_id})-[:HAS_SECTION]->(s:Section)-[:MENTIONS]->(target:Document)
+                        WHERE target.doc_id <> d.doc_id
+                        RETURN s.section_id as id,
+                               s.title as title,
+                               s.doc_id as doc_id,
+                               s.main_section as main_section,
+                               s.clause_level as clause_level
+                        ORDER BY s.section_id
+                    """, doc_id=doc_id)
+                else:
+                    section_nodes_result = session.run("""
+                        MATCH (d:Document)-[:HAS_SECTION]->(s:Section)-[:MENTIONS]->(target:Document)
+                        WHERE target.doc_id <> d.doc_id
+                        RETURN s.section_id as id,
+                               s.title as title,
+                               s.doc_id as doc_id,
+                               s.main_section as main_section,
+                               s.clause_level as clause_level
+                        ORDER BY s.section_id
+                    """)
+
+                for record in section_nodes_result:
+                    sid = record["id"]
+                    if not sid or sid in node_ids:
+                        continue
+                    nodes.append({
+                        "id": sid,
+                        "kind": "section",
+                        "doc_id": record["doc_id"],
+                        "title": record["title"],
+                        "main_section": record["main_section"],
+                        "clause_level": record["clause_level"] or 0,
+                    })
+                    node_ids.add(sid)
+
+                # Document -> Section
+                if doc_id:
+                    has_section_result = session.run("""
+                        MATCH (d:Document {doc_id: $doc_id})-[:HAS_SECTION]->(s:Section)-[:MENTIONS]->(target:Document)
+                        WHERE target.doc_id <> d.doc_id
+                        RETURN d.doc_id as source, s.section_id as target
+                    """, doc_id=doc_id)
+                else:
+                    has_section_result = session.run("""
+                        MATCH (d:Document)-[:HAS_SECTION]->(s:Section)-[:MENTIONS]->(target:Document)
+                        WHERE target.doc_id <> d.doc_id
+                        RETURN d.doc_id as source, s.section_id as target
+                    """)
+
+                for record in has_section_result:
+                    key = (record["source"], record["target"], "HAS_SECTION")
+                    if key in seen_links:
+                        continue
+                    seen_links.add(key)
+                    links.append({
+                        "source": record["source"],
+                        "target": record["target"],
+                        "type": "HAS_SECTION"
+                    })
+
+                # Section -> Document (언급)
+                if doc_id:
+                    mention_result = session.run("""
+                        MATCH (dsrc:Document {doc_id: $doc_id})-[:HAS_SECTION]->(s:Section)-[:MENTIONS]->(d:Document)
+                        WHERE d.doc_id <> dsrc.doc_id
+                        RETURN s.section_id as source, d.doc_id as target
+                    """, doc_id=doc_id)
+                else:
+                    mention_result = session.run("""
+                        MATCH (dsrc:Document)-[:HAS_SECTION]->(s:Section)-[:MENTIONS]->(d:Document)
+                        WHERE d.doc_id <> dsrc.doc_id
+                        RETURN s.section_id as source, d.doc_id as target
+                    """)
+
+                for record in mention_result:
+                    key = (record["source"], record["target"], "MENTIONS")
+                    if key in seen_links:
+                        continue
+                    seen_links.add(key)
+                    links.append({
+                        "source": record["source"],
+                        "target": record["target"],
+                        "type": "MENTIONS"
+                    })
 
             return {
                 "nodes": nodes,

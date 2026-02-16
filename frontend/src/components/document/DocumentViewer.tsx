@@ -29,6 +29,7 @@ export default function DocumentViewer({
   const [isDownloadOpen, setIsDownloadOpen] = React.useState(false)
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const editorInstanceRef = React.useRef<any>(null)
+  const htmlRenderRef = React.useRef<HTMLDivElement | null>(null)
 
   void onlyOfficeEditorMode
 
@@ -66,10 +67,127 @@ export default function DocumentViewer({
     }
   }, [isOnlyOfficeMode, onlyOfficeConfig, onlyOfficeServerUrl])
 
+  const ensureHtml2PdfLoaded = async () => {
+    if ((window as any).html2pdf) return
+    await new Promise<void>((resolve, reject) => {
+      const existing = document.querySelector('script[data-html2pdf="true"]') as HTMLScriptElement | null
+      if (existing) {
+        existing.addEventListener('load', () => resolve(), { once: true })
+        existing.addEventListener('error', () => reject(new Error('html2pdf 로드 실패')), { once: true })
+        return
+      }
+      const script = document.createElement('script')
+      script.src = 'https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js'
+      script.async = true
+      script.dataset.html2pdf = 'true'
+      script.onload = () => resolve()
+      script.onerror = () => reject(new Error('html2pdf 로드 실패'))
+      document.head.appendChild(script)
+    })
+  }
+
+  const ensureHtmlDocxLoaded = async () => {
+    if ((window as any).htmlDocx) return
+    await new Promise<void>((resolve, reject) => {
+      const existing = document.querySelector('script[data-htmldocx="true"]') as HTMLScriptElement | null
+      if (existing) {
+        existing.addEventListener('load', () => resolve(), { once: true })
+        existing.addEventListener('error', () => reject(new Error('html-docx 로드 실패')), { once: true })
+        return
+      }
+      const script = document.createElement('script')
+      script.src = 'https://unpkg.com/html-docx-js/dist/html-docx.js'
+      script.async = true
+      script.dataset.htmldocx = 'true'
+      script.onload = () => resolve()
+      script.onerror = () => reject(new Error('html-docx 로드 실패'))
+      document.head.appendChild(script)
+    })
+  }
+
+  const cloneWithInlineStyles = (root: HTMLElement): HTMLElement => {
+    const clonedRoot = root.cloneNode(true) as HTMLElement
+    const walk = (src: Element, dst: Element) => {
+      const computed = window.getComputedStyle(src as HTMLElement)
+      let cssText = ''
+      for (const prop of Array.from(computed)) {
+        cssText += `${prop}:${computed.getPropertyValue(prop)};`
+      }
+      (dst as HTMLElement).setAttribute('style', cssText)
+
+      const srcChildren = Array.from(src.children)
+      const dstChildren = Array.from(dst.children)
+      for (let i = 0; i < srcChildren.length; i += 1) {
+        if (dstChildren[i]) walk(srcChildren[i], dstChildren[i])
+      }
+    }
+    walk(root, clonedRoot)
+    return clonedRoot
+  }
+
   const handleDownload = async (format: 'pdf' | 'docx' | 'md') => {
     try {
+      // PDF는 프론트 렌더 그대로 다운로드 시도
+      if (format === 'pdf' && !isOnlyOfficeMode && !isEditing && htmlRenderRef.current) {
+        try {
+          await ensureHtml2PdfLoaded()
+          const html2pdf = (window as any).html2pdf
+          if (html2pdf) {
+            const opt = {
+              margin: [0, 0, 0, 0],
+              filename: `${selectedDocument}.pdf`,
+              image: { type: 'jpeg', quality: 0.98 },
+              html2canvas: { scale: 2, useCORS: true, backgroundColor: '#ffffff' },
+              jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' },
+              pagebreak: { mode: ['css', 'legacy'] }
+            }
+            await html2pdf().set(opt).from(htmlRenderRef.current).save()
+            setIsDownloadOpen(false)
+            return
+          }
+        } catch (pdfErr) {
+          console.error('html2pdf 경로 실패, 백엔드 다운로드로 폴백:', pdfErr)
+        }
+      }
+
+      // DOCX도 프론트 렌더 그대로 다운로드 시도
+      if (format === 'docx' && !isOnlyOfficeMode && !isEditing && htmlRenderRef.current) {
+        try {
+          await ensureHtmlDocxLoaded()
+          const htmlDocx = (window as any).htmlDocx
+          if (htmlDocx?.asBlob) {
+            const renderedClone = cloneWithInlineStyles(htmlRenderRef.current)
+            const html = `
+              <!doctype html>
+              <html>
+                <head><meta charset="utf-8" /></head>
+                <body style="margin:0; padding:0; background:#ffffff;">
+                  ${renderedClone.innerHTML}
+                </body>
+              </html>
+            `
+            const blob = htmlDocx.asBlob(html, {
+              orientation: 'portrait',
+              margins: { top: 720, right: 720, bottom: 720, left: 720 }
+            })
+            const url = window.URL.createObjectURL(blob)
+            const a = document.createElement('a')
+            a.href = url
+            a.download = `${selectedDocument}.docx`
+            document.body.appendChild(a)
+            a.click()
+            document.body.removeChild(a)
+            window.URL.revokeObjectURL(url)
+            setIsDownloadOpen(false)
+            return
+          }
+        } catch (docxErr) {
+          console.error('html-docx 경로 실패, 백엔드 다운로드로 폴백:', docxErr)
+        }
+      }
+
       const token = localStorage.getItem('auth_token')
-      const response = await fetch(`${API_URL}/rag/document/${selectedDocument}/download?format=${format}`, {
+      const response = await fetch(`${API_URL}/rag/document/download/${selectedDocument}?format=${format}`, {
         headers: token ? { Authorization: `Bearer ${token}` } : {},
       })
       if (response.ok) {
@@ -82,6 +200,9 @@ export default function DocumentViewer({
         a.click()
         document.body.removeChild(a)
         window.URL.revokeObjectURL(url)
+      } else {
+        const errorText = await response.text()
+        console.error(`다운로드 실패(${response.status}):`, errorText)
       }
     } catch (error) {
       console.error('다운로드 실패:', error)
@@ -275,10 +396,13 @@ export default function DocumentViewer({
               />
             </div>
           ) : (
-            renderDocument()
+            <div ref={htmlRenderRef}>
+              {renderDocument()}
+            </div>
           )}
         </div>
       )}
     </div>
   )
 }
+
