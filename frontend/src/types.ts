@@ -30,12 +30,16 @@ export interface EvaluationScores {
 }
 
 export interface ChatMessage {
+  id?: string
   role: 'user' | 'assistant'
   content: string
   timestamp: Date
   thoughtProcess?: string
   thinkingTime?: number
   evaluation_scores?: EvaluationScores
+  isWaiting?: boolean
+  queuePosition?: number
+  status?: 'waiting' | 'processing' | 'completed' | 'error'
 }
 
 export const API_URL = import.meta.env.VITE_API_URL || '';

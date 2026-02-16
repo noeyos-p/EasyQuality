@@ -63,6 +63,24 @@ export default function ChatMessage({ msg, index, expandedSections, toggleSectio
     )
   }
 
+  if (msg.status === 'waiting' || msg.status === 'processing' || msg.isWaiting) {
+    const isProcessing = msg.status === 'processing'
+    return (
+      <div className="flex flex-col gap-2">
+        <div className="bg-dark-light rounded-lg p-3 border border-dark-border animate-pulse">
+          <div className="flex items-center gap-3">
+            <div className={`w-3 h-3 border-2 ${isProcessing ? 'border-accent' : 'border-accent-blue'} border-t-transparent rounded-full animate-spin`} />
+            <span className="text-[13px] text-txt-secondary">
+              {isProcessing
+                ? '에이전트가 답변을 작성하고 있습니다...'
+                : `답변 대기 중... (현재 순번: ${msg.queuePosition || 1}번째)`}
+            </span>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
   return (
     <div className="flex flex-col gap-2">
       {/* Thought Process */}

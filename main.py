@@ -12,7 +12,7 @@ RAG 챗봇 API v14.0 + Agent (OpenAI)
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request, Depends, status
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request, Depends, status, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field, field_validator
@@ -117,6 +117,9 @@ PRESET_MODELS = {
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 chat_histories: Dict[str, List[Dict]] = {}
+chat_results: Dict[str, Dict] = {}
+chat_queue: asyncio.Queue = asyncio.Queue()
+chat_pending_ids: List[str] = []
 _graph_store = None
 
 def get_graph_store():
@@ -149,9 +152,19 @@ except ImportError as e:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
+    print("🚀 채팅 워커(Worker) 가동 중...")
+    worker_task = asyncio.create_task(chat_worker())
+
     yield
+
     # Shutdown
     print("\n 서버 종료 중...")
+    worker_task.cancel()
+    try:
+        await worker_task
+    except asyncio.CancelledError:
+        print(" 채팅 워커 종료됨")
+
     vector_store.close_client()
     if _graph_store:
         _graph_store.close()
@@ -614,44 +627,38 @@ def list_llm_models():
 #  API 엔드포인트 - 업로드 (LangGraph v9.2)
 # ═══════════════════════════════════════════════════════════════════════════
 
-@app.post("/rag/upload")
-async def upload_document(
-    file: UploadFile = File(...),
-    collection: str = Form("documents"),
-    chunk_size: int = Form(DEFAULT_CHUNK_SIZE),
-    chunk_method: str = Form(DEFAULT_CHUNK_METHOD),
-    model: str = Form("multilingual-e5-small"),
-    overlap: int = Form(DEFAULT_OVERLAP),
-    use_langgraph: bool = Form(True),  #  LangGraph 사용 여부
-    use_llm_metadata: bool = Form(True),  #  LLM 메타데이터 추출 사용 여부
-    version: Optional[str] = Form(None), # 사용자가 직접 지정하는 버전
+def process_upload_task(
+    filename: str,
+    content: bytes,
+    collection: str,
+    chunk_size: int,
+    chunk_method: str,
+    model: str,
+    overlap: int,
+    use_langgraph: bool,
+    use_llm_metadata: bool,
+    version: Optional[str] = None,
 ):
     """
-    문서 업로드 (LangGraph v9.2 파이프라인)
-    
-    - ChromaDB에 벡터 저장
-    - Neo4j에 그래프 저장
-    - 페이지 번호, Parent-Child 계층 메타데이터 포함
+    문서 업로드 처리 (배경 작업)
+    - 기존 업로드 파이프라인을 그대로 사용
     """
     start_time = time.time()
-    
+
     try:
-        content = await file.read()
-        filename = file.filename
-        
-        print(f"\n{'='*70}")
-        print(f"문서 업로드: {filename}")
-        print(f"{'='*70}\n")
+        print(f"\n{'='*70}", flush=True)
+        print(f"문서 업로드 처리 시작: {filename}", flush=True)
+        print(f"{'='*70}\n", flush=True)
 
         # ========================================
         # 문서 파싱
         # ========================================
-        print(f"[1단계] 문서 파싱")
-        print(f"  파이프라인: PDF 조항 v2.0")
-        print(f"  LLM 메타데이터: {'🟢 활성' if use_llm_metadata else '비활성'}")
+        print(f"[1단계] 문서 파싱", flush=True)
+        print(f"  파이프라인: PDF 조항 v2.0", flush=True)
+        print(f"  LLM 메타데이터: {'🟢 활성' if use_llm_metadata else '비활성'}", flush=True)
         if use_llm_metadata:
-            print(f"  LLM 모델: gpt-4o-mini")
-        print()
+            print(f"  LLM 모델: gpt-4o-mini", flush=True)
+        print("", flush=True)
 
         model_path = resolve_model_path(model)
         embed_model = SentenceTransformer(model_path)
@@ -683,16 +690,16 @@ async def upload_document(
         doc_title = result.get("doc_title")
         pipeline_version = "pdf-clause-v2.0"
 
-        print(f"  🟢 파싱 완료")
-        print(f"     • ID: {doc_id}")
-        print(f"     • 제목: {doc_title}")
-        print(f"     • 조항: {result.get('total_clauses')}개")
-        print(f"     • 청크: {len(chunks)}개\n")
+        print(f"  🟢 파싱 완료", flush=True)
+        print(f"     • ID: {doc_id}", flush=True)
+        print(f"     • 제목: {doc_title}", flush=True)
+        print(f"     • 조항: {result.get('total_clauses')}개", flush=True)
+        print(f"     • 청크: {len(chunks)}개\n", flush=True)
         
         # ========================================
         # Weaviate 벡터 저장
         # ========================================
-        print(f"[2단계] Weaviate 벡터 저장")
+        print(f"[2단계] Weaviate 벡터 저장", flush=True)
 
         texts = [c.text for c in chunks]
         metadatas = [
@@ -711,12 +718,12 @@ async def upload_document(
             collection_name=collection,
             model_name=model_path
         )
-        print(f"  🟢 저장 완료: {len(chunks)}개 청크\n")
+        print(f"  🟢 저장 완료: {len(chunks)}개 청크\n", flush=True)
         
         # ========================================
         # PostgreSQL 문서 저장
         # ========================================
-        print(f"[3단계] PostgreSQL 저장")
+        print(f"[3단계] PostgreSQL 저장", flush=True)
 
         try:
             # PDF에서 추출한 원본 텍스트 그대로 사용 (조항 번호 포함)
@@ -729,7 +736,7 @@ async def upload_document(
             final_version = version or result.get("version", "1.0")
             
             if final_version != "1.0":
-                print(f"     [추출] 최종 결정된 버전: {final_version}")
+                print(f"     [추출] 최종 결정된 버전: {final_version}", flush=True)
 
             doc_id_db = sql_store.save_document(
                 doc_name=doc_id,
@@ -741,10 +748,10 @@ async def upload_document(
             # 원본 PDF를 S3에 저장
             if filename.lower().endswith('.pdf'):
                 try:
-                    s3_store.upload_pdf(doc_id, final_version, content)
-                    print(f"  🟢 원본 PDF S3 저장 완료: {doc_id}/v{final_version}")
+                    get_s3_store().upload_pdf(doc_id, final_version, content)
+                    print(f"  🟢 원본 PDF S3 저장 완료: {doc_id}/v{final_version}", flush=True)
                 except Exception as e:
-                    print(f"  🟡 S3 PDF 저장 실패 (무시): {e}")
+                    print(f"  🟡 S3 PDF 저장 실패 (무시): {e}", flush=True)
 
             if doc_id_db and chunks:
                 batch_chunks = [
@@ -756,16 +763,16 @@ async def upload_document(
                     for c in chunks
                 ]
                 sql_store.save_chunks_batch(doc_id_db, batch_chunks)
-                print(f"  🟢 저장 완료: 문서 + {len(chunks)}개 청크\n")
+                print(f"  🟢 저장 완료: 문서 + {len(chunks)}개 청크\n", flush=True)
             else:
-                print(f"  🔴 저장 실패: DB 저장에 실패했습니다 (ID 생성 불가)\n")
+                print(f"  🔴 저장 실패: DB 저장에 실패했습니다 (ID 생성 불가)\n", flush=True)
         except Exception as sql_err:
-            print(f"  🔴 저장 실패: {sql_err}\n")
+            print(f"  🔴 저장 실패: {sql_err}\n", flush=True)
 
         # ========================================
         # Neo4j 그래프 저장
         # ========================================
-        print(f"[4단계] Neo4j 그래프 저장")
+        print(f"[4단계] Neo4j 그래프 저장", flush=True)
         graph_uploaded = False
         graph_sections = 0
 
@@ -778,44 +785,82 @@ async def upload_document(
                 graph_uploaded = True
                 stats = graph.get_graph_stats()
                 graph_sections = stats.get("sections", 0)
-                print(f"  🟢 저장 완료: {graph_sections}개 섹션\n")
+                print(f"  🟢 저장 완료: {graph_sections}개 섹션\n", flush=True)
         except Exception as graph_error:
             # [디버그 로그 보강] 연결 실패 시 구체적인 에러 메시지 출력
-            print(f"  🔴 Neo4j 연결 실패: {graph_error}")
+            print(f"  🔴 Neo4j 연결 실패: {graph_error}", flush=True)
             import traceback
             traceback.print_exc()
-            print(f"  ⚠ 그래프 연동을 건너뛰고 계속 진행합니다.\n")
+            print(f"  ⚠ 그래프 연동을 건너뛰고 계속 진행합니다.\n", flush=True)
         
         # ========================================
         # 완료
         # ========================================
         elapsed = round(time.time() - start_time, 2)
 
-        print(f"{'='*70}")
-        print(f"🟢 업로드 완료 ({elapsed}초)")
-        print(f"{'='*70}\n")
+        print(f"{'='*70}", flush=True)
+        print(f"🟢 업로드 처리 완료 ({elapsed}초)", flush=True)
+        print(f"{'='*70}\n", flush=True)
 
-        return {
-            "success": True,
-            "filename": filename,
-            "doc_id": doc_id,
-            "doc_title": doc_title,
-            "version": final_version,
-            "chunks": len(chunks),
-            "total_clauses": result.get("total_clauses"),
-            "chunk_method": chunk_method,
-            "pipeline_version": pipeline_version,
-            "graph_uploaded": graph_uploaded,
-            "elapsed_seconds": elapsed,
-            "sample_metadata": metadatas[0] if metadatas else {},
-        }
-
-    except HTTPException:
-        raise
+    except HTTPException as e:
+        print(f"🔴 업로드 처리 실패: {e.detail}", flush=True)
+        return
     except Exception as e:
         import traceback
         traceback.print_exc()
-        raise HTTPException(500, f"🔴 실패: {str(e)}")
+        print(f"🔴 업로드 처리 실패: {str(e)}", flush=True)
+        return
+
+
+@app.post("/rag/upload")
+async def upload_document(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    collection: str = Form("documents"),
+    chunk_size: int = Form(DEFAULT_CHUNK_SIZE),
+    chunk_method: str = Form(DEFAULT_CHUNK_METHOD),
+    model: str = Form("multilingual-e5-small"),
+    overlap: int = Form(DEFAULT_OVERLAP),
+    use_langgraph: bool = Form(True),
+    use_llm_metadata: bool = Form(True),
+    version: Optional[str] = Form(None),
+):
+    """
+    문서 업로드 요청을 즉시 접수하고, 실제 처리는 배경 작업으로 수행.
+    """
+    try:
+        content = await file.read()
+        filename = file.filename
+
+        print(f"\n{'='*70}", flush=True)
+        print(f"문서 업로드 요청 접수: {filename}", flush=True)
+        print("  처리 방식: 비동기 (Background Tasks)", flush=True)
+        print(f"{'='*70}\n", flush=True)
+
+        background_tasks.add_task(
+            process_upload_task,
+            filename=filename,
+            content=content,
+            collection=collection,
+            chunk_size=chunk_size,
+            chunk_method=chunk_method,
+            model=model,
+            overlap=overlap,
+            use_langgraph=use_langgraph,
+            use_llm_metadata=use_llm_metadata,
+            version=version,
+        )
+
+        return {
+            "success": True,
+            "message": f"'{filename}' 문서의 업로드가 시작되었습니다. 처리가 완료되는 동안 다른 작업을 수행하실 수 있습니다.",
+            "filename": filename,
+            "processing_mode": "background",
+        }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, f"🔴 요청 실패: {str(e)}")
 
 
 def _upload_to_neo4j_from_pipeline(graph, result: dict, filename: str):
@@ -838,167 +883,174 @@ def _upload_to_neo4j_from_pipeline(graph, result: dict, filename: str):
 # API 엔드포인트 - 챗봇
 # ═══════════════════════════════════════════════════════════════════════════
 
-@app.post("/chat")
-async def chat(request: ChatRequest):
-    """
-    Main Agent Chat Endpoint
-    - Manual RAG 로직 제거됨
-    - 오직 Agent Orchestrator를 통해서만 답변
-    """
-    import asyncio
+async def process_chat_request(request: ChatRequest) -> Dict:
+    """실제 에이전트 질의 처리 본문 (워커/동기 엔드포인트 공용)."""
     print(f" [Agent] 요청 수신: {request.message}")
 
-    try:
-        # Agent 초기화
-        init_agent_tools(vector_store, get_graph_store(), sql_store)
+    # Agent 초기화
+    init_agent_tools(vector_store, get_graph_store(), sql_store)
 
-        # 🧠 롱텀 메모리: 이전 대화 기록 및 유사 기억 조회
-        chat_history = []
-        user_id = request.user_id
-        if user_id:
-            try:
-                # 1. 최근 대화 (History)
-                chat_history = sql_store.get_conversation_history(user_id, limit=6)
+    # 세션 ID 선할당 (None 방지)
+    session_id = request.session_id or str(uuid.uuid4())
 
-                # 2. 관련 기억 (Semantic Memory)
-                query_embedding = embed_text(request.message)
-                semantic_memories = sql_store.search_memory_similar(user_id, query_embedding, limit=3)
+    # 롱텀 메모리: 이전 대화 기록 + 유사 기억 로드
+    chat_history = []
+    user_id = request.user_id
+    query_embedding = None
 
-                if semantic_memories:
-                    memory_block = "\n".join([f"- Q: {m['question']}\n  A: {m['answer']}" for m in semantic_memories])
-                    print(f"  🧠 [Memory] 관련 기억 {len(semantic_memories)}건 발견")
-                    chat_history = [{"role": "system", "content": f"[관련 과거 기억]\n{memory_block}"}] + chat_history
-                print(f"  🧠 [Memory] 사용자 {user_id}의 컨텍스트 로드 완료")
-            except Exception as e:
-                print(f"  ⚠️ [Memory] 조회 실패: {e}")
-                import traceback
-                traceback.print_exc()
-
-        # Agent 실행 (이벤트 루프 차단을 방지하기 위해 별도 스레드에서 실행)
-        response = await asyncio.to_thread(
-            run_agent,
-            query=request.message,
-            session_id=request.session_id or str(uuid.uuid4()),
-            model_name=request.llm_model or "gpt-4o-mini",
-            chat_history=chat_history
-        )
-        
-        answer = response.get("answer")
-        
-        # 🧠 롱텀 메모리: 새로운 대화 저장 (임베딩 + 요약)
-        if user_id and answer:
-            try:
-                if 'query_embedding' not in locals():
-                    query_embedding = embed_text(request.message)
-                
-                summarized_answer = answer
-                if len(answer) > 200:
-                    summary_prompt = f"다음 Q&A를 나중을 위해 핵심만 1~2줄로 요약해줘.\nQ: {request.message}\nA: {answer}\n\n요약 (존댓말):"
-                    try:
-                        summarized = get_llm_response(
-                            prompt=summary_prompt,
-                            llm_model="gpt-4o-mini",
-                            llm_backend="openai",
-                            max_tokens=150,
-                            temperature=0.3
-                        )
-                        summarized_answer = summarized.replace("요약:", "").strip()
-                    except:
-                        summarized_answer = answer[:500]
-
-                sql_store.save_memory(request.message, summarized_answer, user_id, embedding=query_embedding, session_id=request.session_id or "default")
-                print(f"  💾 [Memory] 대화 요약 저장 완료 (길이: {len(summarized_answer)})")
-            except Exception as e:
-                print(f"  ⚠️ [Memory] 저장 실패: {e}")
-                import traceback
-                traceback.print_exc()
-
-        # 🧠 롱텀 메모리: 새로운 대화 저장 (임베딩 + 요약)
-        if user_id and answer:
-            try:
-                if 'query_embedding' not in locals():
-                    query_embedding = embed_text(request.message)
-
-                summarized_answer = answer
-                if len(answer) > 200:
-                    summary_prompt = f"다음 Q&A를 나중을 위해 핵심만 1~2줄로 요약해줘.\nQ: {request.message}\nA: {answer}\n\n요약 (존댓말):"
-                    try:
-                        summarized = get_llm_response(
-                            prompt=summary_prompt,
-                            llm_model="gpt-4o-mini",
-                            llm_backend="openai",
-                            max_tokens=150,
-                            temperature=0.3
-                        )
-                        summarized_answer = summarized.replace("요약:", "").strip()
-                    except Exception:
-                        summarized_answer = answer[:500]
-
-                sql_store.save_memory(
-                    request.message, summarized_answer, user_id,
-                    embedding=query_embedding,
-                    session_id=request.session_id or "default"
-                )
-                print(f"  💾 [Memory] 대화 요약 저장 완료 (길이: {len(summarized_answer)})")
-            except Exception as e:
-                print(f"  ⚠️ [Memory] 저장 실패: {e}")
-                import traceback
-                traceback.print_exc()
-
-        # LLM as a Judge 평가
-        evaluation_scores = None
-        error_patterns = ["오류가 발생", "에러", "실패", "Error", "Exception", "찾을 수 없", "준비하지 못", "로딩 에러"]
-        is_error_message = any(pattern in answer for pattern in error_patterns)
-        
+    if user_id:
         try:
-            from backend.evaluation import AgentEvaluator
-            if len(answer) >= 20 and not is_error_message:
-                evaluator = AgentEvaluator(judge_model="gpt-4o-mini", sql_store=sql_store)
-                context = response.get("agent_log", {}).get("context", "")
-                if isinstance(context, list):
-                    context = "\n\n".join(context)
-                
-                evaluation_scores = evaluator.evaluate_single(
-                    question=request.message,
-                    answer=answer,
-                    context=context,
-                    metrics=["faithfulness", "groundness", "relevancy", "correctness"]
-                )
-                # 로그 출력
-                if evaluation_scores:
-                    print(f"\n{'='*60}")
-                    print(f"평가 결과 (평균: {evaluation_scores.get('average_score', 0)}/5)")
-                    print(f"{'='*60}")
-                    for metric, result in evaluation_scores.items():
-                        if metric == "average_score":
-                            continue
-                        score = result.get("score", 0)
-                        reasoning = result.get("reasoning", "")
-                        print(f"\n[{metric.upper()}]")
-                        print(f"  점수: {score}/5")
-                        print(f"  이유: {reasoning}")
-                        if "rdb_verification" in result:
-                            rdb = result["rdb_verification"]
-                            print(f"  📊 RDB 검증: 정확도 {rdb.get('accuracy_rate', 0)}% ({rdb.get('verified_citations', 0)}/{rdb.get('total_citations', 0)})")
-                    print(f"{'='*60}\n")
-        except ImportError:
-            print("평가 모듈 사용 불가 (선택적 기능)")
-        except Exception as eval_error:
-            print(f"평가 실행 실패 (계속 진행): {eval_error}")
-            evaluation_scores = None
+            chat_history = sql_store.get_conversation_history(user_id, limit=6)
+            query_embedding = embed_text(request.message)
+            semantic_memories = sql_store.search_memory_similar(user_id, query_embedding, limit=3)
 
-        return {
-            "session_id": request.session_id,
-            "answer": answer,
-            "sources": [],
-            "agent_log": response,
-            "evaluation_scores": evaluation_scores
-        }
-    except Exception as e:
-        print(f" [Agent] 에러: {e}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(500, str(e))
+            if semantic_memories:
+                memory_block = "\n".join([f"- Q: {m['question']}\n  A: {m['answer']}" for m in semantic_memories])
+                print(f"  🧠 [Memory] 관련 기억 {len(semantic_memories)}건 발견")
+                chat_history = [{"role": "system", "content": f"[관련 과거 기억]\n{memory_block}"}] + chat_history
+
+            print(f"  🧠 [Memory] 사용자 {user_id}의 컨텍스트 로드 완료")
+        except Exception as e:
+            print(f"  ⚠️ [Memory] 조회 실패: {e}")
+            import traceback
+            traceback.print_exc()
+
+    response = await asyncio.to_thread(
+        run_agent,
+        query=request.message,
+        session_id=session_id,
+        model_name=request.llm_model or "gpt-4o-mini",
+        chat_history=chat_history
+    )
+
+    answer = response.get("answer") or ""
+
+    # 롱텀 메모리: 새로운 대화 저장
+    if user_id and answer:
+        try:
+            if query_embedding is None:
+                query_embedding = embed_text(request.message)
+
+            summarized_answer = answer
+            if len(answer) > 200:
+                summary_prompt = f"다음 Q&A를 나중을 위해 핵심만 1~2줄로 요약해줘.\nQ: {request.message}\nA: {answer}\n\n요약 (존댓말):"
+                try:
+                    summarized = get_llm_response(
+                        prompt=summary_prompt,
+                        llm_model="gpt-4o-mini",
+                        llm_backend="openai",
+                        max_tokens=150,
+                        temperature=0.3
+                    )
+                    summarized_answer = summarized.replace("요약:", "").strip()
+                except Exception:
+                    summarized_answer = answer[:500]
+
+            sql_store.save_memory(
+                request.message,
+                summarized_answer,
+                user_id,
+                embedding=query_embedding,
+                session_id=session_id
+            )
+            print(f"  💾 [Memory] 대화 요약 저장 완료 (길이: {len(summarized_answer)})")
+        except Exception as e:
+            print(f"  ⚠️ [Memory] 저장 실패: {e}")
+            import traceback
+            traceback.print_exc()
+
+    # LLM as a Judge 평가
+    evaluation_scores = None
+    error_patterns = ["오류가 발생", "에러", "실패", "Error", "Exception", "찾을 수 없", "준비하지 못", "로딩 에러"]
+    is_error_message = any(pattern in answer for pattern in error_patterns)
+
+    try:
+        from backend.evaluation import AgentEvaluator
+        if len(answer) >= 20 and not is_error_message:
+            evaluator = AgentEvaluator(judge_model="gpt-4o-mini", sql_store=sql_store)
+            context = response.get("agent_log", {}).get("context", "")
+            if isinstance(context, list):
+                context = "\n\n".join(context)
+
+            evaluation_scores = evaluator.evaluate_single(
+                question=request.message,
+                answer=answer,
+                context=context,
+                metrics=["faithfulness", "groundness", "relevancy", "correctness"]
+            )
+    except ImportError:
+        print("평가 모듈 사용 불가 (선택적 기능)")
+    except Exception as eval_error:
+        print(f"평가 실행 실패 (계속 진행): {eval_error}")
+        evaluation_scores = None
+
+    return {
+        "session_id": session_id,
+        "answer": answer,
+        "sources": [],
+        "agent_log": response,
+        "evaluation_scores": evaluation_scores
+    }
+
+
+async def chat_worker():
+    """큐에서 질문을 하나씩 꺼내어 순차적으로 답변을 생성하는 워커."""
+    while True:
+        request_id, request = await chat_queue.get()
+        try:
+            print(f" 🚀 [Chat Worker] 처리 시작: {request_id}")
+            chat_results[request_id] = {"status": "processing", "result": None}
+
+            if request_id in chat_pending_ids:
+                chat_pending_ids.remove(request_id)
+
+            result_data = await process_chat_request(request)
+            chat_results[request_id] = {"status": "completed", "result": result_data}
+            print(f" ✅ [Chat Worker] 처리 완료: {request_id}")
+        except Exception as e:
+            print(f" 🔴 [Chat Worker] 에러: {e}")
+            chat_results[request_id] = {"status": "error", "error": str(e)}
+            if request_id in chat_pending_ids:
+                chat_pending_ids.remove(request_id)
+        finally:
+            chat_queue.task_done()
+
+
+@app.post("/chat")
+async def chat(request: ChatRequest):
+    """순차 대기열 채팅 엔드포인트."""
+    request_id = str(uuid.uuid4())
+    print(f" [Agent] 대기열 등록: {request_id}")
+
+    chat_results[request_id] = {"status": "waiting", "result": None}
+    chat_pending_ids.append(request_id)
+
+    await chat_queue.put((request_id, request))
+    position = chat_pending_ids.index(request_id) + 1
+
+    return {
+        "success": True,
+        "request_id": request_id,
+        "message": f"질문이 대기열에 등록되었습니다. (현재 대기 순번: {position}번째)",
+        "status": "waiting",
+        "position": position
+    }
+
+
+@app.get("/chat/status/{request_id}")
+async def get_chat_status(request_id: str):
+    """채팅 작업의 상태와 대기 순번 조회."""
+    if request_id not in chat_results:
+        raise HTTPException(404, "요청 ID를 찾을 수 없습니다.")
+
+    status_data = chat_results[request_id].copy()
+
+    if status_data["status"] == "waiting" and request_id in chat_pending_ids:
+        status_data["position"] = chat_pending_ids.index(request_id) + 1
+    else:
+        status_data.pop("position", None)
+
+    return status_data
 
 
 @app.get("/chat/history/{session_id}")

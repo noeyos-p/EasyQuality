@@ -22,6 +22,16 @@ export default function ChatPanel({ isVisible, onDocumentSelect }: ChatPanelProp
   const [mentionTriggerPos, setMentionTriggerPos] = useState<number | null>(null)
   const [selectedDocs, setSelectedDocs] = useState<string[]>([])
 
+  const [notifications, setNotifications] = useState<{ id: string; message: string }[]>([])
+  const activeIntervals = useRef<Record<string, ReturnType<typeof setInterval>>>({})
+  const notifiedIds = useRef<Set<string>>(new Set())
+
+  useEffect(() => {
+    return () => {
+      Object.values(activeIntervals.current).forEach(clearInterval)
+    }
+  }, [])
+
   const [expandedSections, setExpandedSections] = useState<Set<string>>(new Set())
 
   const chatEndRef = useRef<HTMLDivElement>(null)
@@ -43,28 +53,143 @@ export default function ChatPanel({ isVisible, onDocumentSelect }: ChatPanelProp
     fetchDocNames()
   }, [])
 
+  const updateMessage = (id: string, updates: Partial<ChatMessage>) => {
+    setMessages(prev => prev.map(m => (m.id === id ? { ...m, ...updates } : m)))
+  }
+
+  const checkAllFinished = () => {
+    setMessages(prev => {
+      const stillWaiting = prev.some(m => m.isWaiting)
+      if (!stillWaiting) setIsLoading(false)
+      return prev
+    })
+  }
+
+  const pollAnswer = (requestId: string, startTime: number, targetId: string) => {
+    if (activeIntervals.current[targetId]) return
+
+    let attempts = 0
+    const maxAttempts = 180
+    let lastPosition = -1
+
+    const intervalId = setInterval(async () => {
+      attempts += 1
+      activeIntervals.current[targetId] = intervalId
+
+      try {
+        const token = localStorage.getItem('auth_token')
+        const response = await fetch(`${API_URL}/chat/status/${requestId}`, {
+          headers: token ? { Authorization: `Bearer ${token}` } : {},
+        })
+        const data = await response.json()
+
+        if (data.status === 'completed') {
+          clearInterval(intervalId)
+          delete activeIntervals.current[targetId]
+
+          const thinkingTime = Math.floor((Date.now() - startTime) / 1000)
+          const result = data.result
+
+          if (!sessionId && result?.session_id) {
+            setSessionId(result.session_id)
+          }
+
+          updateMessage(targetId, {
+            content: result?.answer || '답변을 생성하지 못했습니다.',
+            timestamp: new Date(),
+            thoughtProcess: result?.agent_log ? JSON.stringify(result.agent_log, null, 2) : 'Agent reasoning...',
+            thinkingTime,
+            evaluation_scores: result?.evaluation_scores,
+            status: 'completed',
+            isWaiting: false,
+          })
+
+          checkAllFinished()
+
+          if (!notifiedIds.current.has(targetId)) {
+            notifiedIds.current.add(targetId)
+            const notificationId = Math.random().toString(36).slice(2, 11)
+            setNotifications(prev => [...prev, { id: notificationId, message: '에이전트의 답변이 도착했습니다!' }])
+            setTimeout(() => {
+              setNotifications(prev => prev.filter(n => n.id !== notificationId))
+            }, 4000)
+          }
+        } else if (data.status === 'waiting') {
+          if (data.position !== lastPosition) {
+            lastPosition = data.position
+            updateMessage(targetId, {
+              status: 'waiting',
+              queuePosition: data.position || 1,
+            })
+          }
+        } else if (data.status === 'processing') {
+          updateMessage(targetId, {
+            status: 'processing',
+            queuePosition: 0,
+          })
+        } else if (data.status === 'error') {
+          clearInterval(intervalId)
+          delete activeIntervals.current[targetId]
+          updateMessage(targetId, {
+            content: `처리에 실패했습니다: ${data.error}`,
+            status: 'error',
+            isWaiting: false,
+          })
+          checkAllFinished()
+        } else if (attempts >= maxAttempts) {
+          clearInterval(intervalId)
+          delete activeIntervals.current[targetId]
+          updateMessage(targetId, {
+            content: '답변 생성 시간이 초과되었습니다.',
+            status: 'error',
+            isWaiting: false,
+          })
+          checkAllFinished()
+        }
+      } catch (error) {
+        console.error('Polling error:', error)
+      }
+    }, 2000)
+  }
+
   const sendMessage = async () => {
-    if (!inputMessage.trim() || isLoading) return
+    if (!inputMessage.trim()) return
 
     const currentInput = inputMessage
     const currentDocs = [...selectedDocs]
-
     const formattedContent = currentDocs.length > 0
       ? `${currentDocs.map(d => `@${d}`).join(' ')} ${currentInput}`
       : currentInput
 
-    const userMessage: ChatMessage = { role: 'user', content: formattedContent, timestamp: new Date() }
+    const assistantId = Math.random().toString(36).slice(2, 11)
 
-    setMessages(prev => [...prev, userMessage])
+    setMessages(prev => [
+      ...prev,
+      { role: 'user', content: formattedContent, timestamp: new Date() },
+      {
+        id: assistantId,
+        role: 'assistant',
+        content: '',
+        timestamp: new Date(),
+        status: 'waiting',
+        isWaiting: true,
+        queuePosition: 0,
+      },
+    ])
+
     setInputMessage('')
     setIsLoading(true)
 
     const startTime = Date.now()
 
     try {
+      const token = localStorage.getItem('auth_token')
       const response = await fetch(`${API_URL}/chat`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
         body: JSON.stringify({
           message: currentDocs.length > 0
             ? `[Selected Documents: ${currentDocs.join(', ')}]\n${currentInput}`
@@ -74,29 +199,32 @@ export default function ChatPanel({ isVisible, onDocumentSelect }: ChatPanelProp
         }),
       })
 
-      const thinkingTime = Math.floor((Date.now() - startTime) / 1000)
-
       if (response.ok) {
         const data = await response.json()
-        if (!sessionId) setSessionId(data.session_id)
+        const requestId = data.request_id
 
-        const assistantMessage: ChatMessage = {
-          role: 'assistant',
-          content: data.answer || '답변을 생성하지 못했습니다.',
-          timestamp: new Date(),
-          thoughtProcess: data.agent_log ? JSON.stringify(data.agent_log, null, 2) : 'Agent reasoning...',
-          thinkingTime,
-          evaluation_scores: data.evaluation_scores,
+        if (data.position) {
+          updateMessage(assistantId, { queuePosition: data.position, status: 'waiting' })
         }
-        setMessages(prev => [...prev, assistantMessage])
+
+        pollAnswer(requestId, startTime, assistantId)
       } else {
         const error = await response.json()
-        setMessages(prev => [...prev, { role: 'assistant', content: `오류가 발생했습니다: ${error.detail}`, timestamp: new Date() }])
+        updateMessage(assistantId, {
+          content: `오류가 발생했습니다: ${error.detail}`,
+          isWaiting: false,
+          status: 'error',
+        })
+        checkAllFinished()
       }
     } catch (error) {
-      setMessages(prev => [...prev, { role: 'assistant', content: `네트워크 오류: ${error}`, timestamp: new Date() }])
+      updateMessage(assistantId, {
+        content: `네트워크 오류: ${error}`,
+        isWaiting: false,
+        status: 'error',
+      })
+      checkAllFinished()
     } finally {
-      setIsLoading(false)
       setSelectedDocs([])
     }
   }
@@ -132,9 +260,7 @@ export default function ChatPanel({ isVisible, onDocumentSelect }: ChatPanelProp
     if (lastAtPos !== -1) {
       const textAfterAt = value.substring(lastAtPos + 1, cursorPos)
       if (!textAfterAt.includes(' ')) {
-        const filtered = docNames.filter(doc =>
-          doc.name.toLowerCase().includes(textAfterAt.toLowerCase())
-        )
+        const filtered = docNames.filter(doc => doc.name.toLowerCase().includes(textAfterAt.toLowerCase()))
         setSuggestions(filtered)
         setShowSuggestions(filtered.length > 0)
         setSuggestionIndex(0)
@@ -218,6 +344,21 @@ export default function ChatPanel({ isVisible, onDocumentSelect }: ChatPanelProp
           onSelectSuggestion={selectSuggestion}
           onRemoveDoc={removeSelectedDoc}
         />
+      </div>
+
+      <div className="fixed bottom-24 right-6 flex flex-col gap-2 z-[3000]">
+        {notifications.map(n => (
+          <div key={n.id} className="bg-accent-blue text-white px-4 py-3 rounded-lg shadow-2xl flex items-center gap-3 animate-slide-in-right">
+            <div className="w-2 h-2 bg-white rounded-full animate-pulse" />
+            <span className="text-[13px] font-medium">{n.message}</span>
+            <button
+              onClick={() => setNotifications(prev => prev.filter(notif => notif.id !== n.id))}
+              className="ml-2 hover:opacity-70"
+            >
+              ×
+            </button>
+          </div>
+        ))}
       </div>
     </aside>
   )
