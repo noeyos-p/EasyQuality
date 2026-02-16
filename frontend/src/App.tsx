@@ -75,18 +75,27 @@ function App() {
         // 필터링: 사용자가 이미 닫은 작업은 제외
         const visibleTasks = tasks.filter(t => !closedTaskIds.has(t.id));
 
-        // 상태 변경 감지 및 알림
-        tasks.forEach(task => {
-          setActiveTasks(prev => {
+        // 이전 상태와 비교하여 새로운 완료/에러 상태 감지
+        setActiveTasks(prev => {
+          tasks.forEach(task => {
             const prevTask = prev.find(t => t.id === task.id);
+
+            // 상태가 완료로 변경된 경우
             if (task.status === 'completed' && (!prevTask || prevTask.status !== 'completed')) {
-              addToast(`'${task.filename || task.doc_name || '문서'}' 처리가 완료되었습니다.`, 'success');
+              // 백엔드 메시지(예: '적재가 완료되었습니다', '수정 저장이 완료되었습니다') 활용
+              const baseMsg = task.message || '작업이 완료되었습니다.';
+              const docName = task.filename || task.doc_name || '문서';
+              addToast(`[완료] ${docName}: ${baseMsg}`, 'success');
               setRefreshCounter(c => c + 1);
-            } else if (task.status === 'error' && (!prevTask || prevTask.status !== 'error')) {
-              addToast(`'${task.filename || task.doc_name || '문서'}' 처리 중 오류가 발생했습니다.`, 'error');
             }
-            return visibleTasks; // 항상 최신 목록으로 교체
+            // 상태가 에러로 변경된 경우
+            else if (task.status === 'error' && (!prevTask || prevTask.status !== 'error')) {
+              const errorMsg = task.message || '처리 중 오류가 발생했습니다.';
+              const docName = task.filename || task.doc_name || '문서';
+              addToast(`[오류] ${docName}: ${errorMsg}`, 'error');
+            }
           });
+          return visibleTasks;
         });
 
       } catch (err) {
