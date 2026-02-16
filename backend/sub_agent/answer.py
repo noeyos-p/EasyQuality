@@ -77,6 +77,38 @@ def answer_agent_node(state: AgentState):
         prev_norm = norm if norm else prev_norm
     converted = "\n".join(deduped_lines).strip()
 
+    # NO_INFO_FOUND 문구가 포함되어도 실제 본문/근거가 존재하면 제거
+    no_info_patterns = [
+        r'No relevant information found within the searched documents\.\s*\[NO_INFO_FOUND\]',
+        r'No relevant information found within the searched documents\.',
+        r'\[NO_INFO_FOUND\]',
+        r'검색된 문서 내에서 관련 정보를 찾을 수 없(?:습니다)?\.?',
+        r'검색된 정보가 없(?:습니다|어요)\.?'
+    ]
+
+    def _has_substantive_content(text: str) -> bool:
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if not lines:
+            return False
+        # NO_INFO / 태그 / 참고문서 헤더 라인 제외 후 내용 존재 여부 확인
+        meaningful = []
+        for ln in lines:
+            if ln in ("[DONE]", "[참고 문서]"):
+                continue
+            if re.search(r'^\[NO_INFO_FOUND\]$', ln):
+                continue
+            if re.search(r'^No relevant information found within the searched documents\.?$', ln, re.IGNORECASE):
+                continue
+            if re.search(r'^검색된 문서 내에서 관련 정보를 찾을 수 없', ln):
+                continue
+            meaningful.append(ln)
+        return len(meaningful) > 0
+
+    if _has_substantive_content(converted):
+        for p in no_info_patterns:
+            converted = re.sub(p, '', converted, flags=re.IGNORECASE)
+        converted = re.sub(r'\n{3,}', '\n\n', converted).strip()
+
     # ========================================
     # [참고 문서] 섹션 자동 생성
     # ========================================

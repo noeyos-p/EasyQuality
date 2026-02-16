@@ -32,6 +32,7 @@ export default function DocumentViewer({
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const editorInstanceRef = React.useRef<any>(null)
   const htmlRenderRef = React.useRef<HTMLDivElement | null>(null)
+  const editablePageRef = React.useRef<HTMLDivElement | null>(null)
 
   void onlyOfficeEditorMode
 
@@ -254,10 +255,10 @@ export default function DocumentViewer({
     setIsDownloadOpen(false)
   }
 
-  const renderDocument = () => {
-    if (!documentContent) return null
+  const renderDocument = (sourceContent: string | null, editable: boolean = false) => {
+    if (!sourceContent) return null
 
-    const lines = documentContent
+    const lines = sourceContent
       .replace(/<!-- PAGE:\d+ -->/g, '')
       .split('\n')
 
@@ -376,7 +377,25 @@ export default function DocumentViewer({
     return (
       <div style={{ width: '794px' }}>
         <div className="bg-white" style={{ minHeight: '1123px', padding: '96px 90px' }}>
-          <div className="break-words text-black">
+          <div
+            ref={editable ? editablePageRef : undefined}
+            className={`break-words text-black ${editable ? 'outline-none' : ''}`}
+            contentEditable={editable}
+            suppressContentEditableWarning={editable}
+            style={editable ? { whiteSpace: 'pre-wrap' } : undefined}
+            onBlur={
+              editable
+                ? (e) => {
+                    const text = (e.currentTarget as HTMLDivElement).innerText
+                    const normalized = text
+                      .replace(/\u00A0/g, ' ')
+                      .replace(/\n{3,}/g, '\n\n')
+                      .trim()
+                    setEditedContent(normalized)
+                  }
+                : undefined
+            }
+          >
             {elements}
           </div>
         </div>
@@ -431,17 +450,15 @@ export default function DocumentViewer({
       ) : (
         <div className="flex-1 overflow-y-auto p-0 bg-[#c8c8c8] flex flex-col items-center gap-[30px]">
           {isEditing ? (
-            <div className="w-full max-w-[1100px] h-[calc(100vh-120px)] bg-dark-deeper border border-dark-border rounded overflow-hidden shadow-[0_10px_30px_rgba(0,0,0,0.3)]">
-              <textarea
-                className="document-editor w-full h-full bg-transparent text-[#d4d4d4] border-none p-[30px] font-mono text-[14px] leading-[1.6] resize-none outline-none"
-                value={editedContent}
-                onChange={(e) => setEditedContent(e.target.value)}
-                placeholder="문서 내용을 수정하세요..."
-              />
+            <div className="w-full flex flex-col items-center gap-3 py-4">
+              <div className="text-[12px] text-txt-secondary">
+                화면에 보이는 형태 그대로 직접 수정할 수 있습니다.
+              </div>
+              {renderDocument(editedContent || documentContent, true)}
             </div>
           ) : (
             <div ref={htmlRenderRef}>
-              {renderDocument()}
+              {renderDocument(documentContent, false)}
             </div>
           )}
         </div>
