@@ -18,6 +18,7 @@ export default defineConfig({
       '/test': 'http://localhost:8000',
       '/onlyoffice': 'http://localhost:8000',
       '/auth': 'http://localhost:8000',
+      '/processing': 'http://localhost:8000',
     },
   },
 })

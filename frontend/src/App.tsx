@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import Sidebar from './components/layout/Sidebar'
 import DocumentManagementPanel from './components/document/DocumentManagementPanel'
 import ChangeHistoryPanel from './components/history/ChangeHistoryPanel'
@@ -50,13 +50,16 @@ function App() {
   const [closedTaskIds, setClosedTaskIds] = useState<Set<string>>(new Set())
   const [refreshCounter, setRefreshCounter] = useState(0)
 
+  // 🔄 이전 태스크 상태 추적용 Ref (의존성 무한 루프 방지)
+  const prevTasksRef = useRef<TaskStatus[]>([])
+
   // 🆕 전역 알림(Toast) 상태
   const [toasts, setToasts] = useState<ToastMessage[]>([])
 
-  const addToast = (message: string, type: 'success' | 'error' | 'info' = 'success') => {
+  const addToast = useCallback((message: string, type: 'success' | 'error' | 'info' = 'success') => {
     const id = Math.random().toString(36).substr(2, 9)
     setToasts(prev => [...prev, { id, message, type }])
-  }
+  }, [])
 
   const removeToast = (id: string) => {
     setToasts(prev => prev.filter(t => t.id !== id))
@@ -70,34 +73,28 @@ function App() {
       try {
         const res = await fetch(`${API_URL}/processing/list`);
         if (!res.ok) return;
-        const tasks: TaskStatus[] = await res.json();
+        const currentTasks: TaskStatus[] = await res.json();
 
-        // 필터링: 사용자가 이미 닫은 작업은 제외
-        const visibleTasks = tasks.filter(t => !closedTaskIds.has(t.id));
-
-        // 이전 상태와 비교하여 새로운 완료/에러 상태 감지
-        setActiveTasks(prev => {
-          tasks.forEach(task => {
-            const prevTask = prev.find(t => t.id === task.id);
-
-            // 상태가 완료로 변경된 경우
-            if (task.status === 'completed' && (!prevTask || prevTask.status !== 'completed')) {
-              // 백엔드 메시지(예: '적재가 완료되었습니다', '수정 저장이 완료되었습니다') 활용
-              const baseMsg = task.message || '작업이 완료되었습니다.';
-              const docName = task.filename || task.doc_name || '문서';
-              addToast(`[완료] ${docName}: ${baseMsg}`, 'success');
-              setRefreshCounter(c => c + 1);
-            }
-            // 상태가 에러로 변경된 경우
-            else if (task.status === 'error' && (!prevTask || prevTask.status !== 'error')) {
-              const errorMsg = task.message || '처리 중 오류가 발생했습니다.';
-              const docName = task.filename || task.doc_name || '문서';
-              addToast(`[오류] ${docName}: ${errorMsg}`, 'error');
-            }
-          });
-          return visibleTasks;
+        // 1. 새로운 완료/에러 상태 감지
+        currentTasks.forEach(task => {
+          const prevTask = prevTasksRef.current.find(t => t.id === task.id);
+          if (task.status === 'completed' && (!prevTask || prevTask.status !== 'completed')) {
+            const docName = task.filename || task.doc_name || '문서';
+            const msg = task.message || '작업이 성공적으로 처리되었습니다.';
+            addToast(`[성공] ${docName}: ${msg}`, 'success');
+            setRefreshCounter(c => c + 1);
+          }
+          else if (task.status === 'error' && (!prevTask || prevTask.status !== 'error')) {
+            const docName = task.filename || task.doc_name || '문서';
+            const msg = task.message || '처리 중 오류가 발생했습니다.';
+            addToast(`[오류] ${docName}: ${msg}`, 'error');
+          }
         });
 
+        // 2. Ref 업데이트 및 상태 반영
+        prevTasksRef.current = currentTasks;
+        const visibleTasks = currentTasks.filter(t => !closedTaskIds.has(t.id));
+        setActiveTasks(visibleTasks);
       } catch (err) {
         console.error('Task polling error:', err);
       }
@@ -105,14 +102,22 @@ function App() {
 
     const interval = setInterval(pollTasks, 3000);
     pollTasks();
-
     return () => clearInterval(interval);
-  }, [isConnected, closedTaskIds]);
+  }, [isConnected, closedTaskIds, addToast]);
 
   const handleCloseTask = (id: string) => {
     setClosedTaskIds(prev => new Set(prev).add(id));
     setActiveTasks(prev => prev.filter(t => t.id !== id));
   };
+
+  // 🔄 refreshCounter가 변경되면 (작업 완료 등) 현재 보는 문서도 갱신 시도
+  useEffect(() => {
+    if (selectedDocument && !isEditing && !isOnlyOfficeMode) {
+      // 문서 타입 정보를 찾기 위해 groupedDocuments 활용 가능하지만, 
+      // handleDocumentSelect 내부에서 이미 타입을 감지하므로 직접 호출
+      handleDocumentSelect(selectedDocument);
+    }
+  }, [refreshCounter]);
   // 백엔드 연결 확인
   useEffect(() => {
     const checkBackendStatus = async () => {

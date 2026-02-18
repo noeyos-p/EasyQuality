@@ -43,7 +43,7 @@ const ToastItem: React.FC<{ toast: ToastMessage; onRemove: (id: string) => void 
     };
 
     return (
-        <div className={`${bgColors[toast.type]} border p-4 rounded-lg shadow-lg flex items-center gap-3 min-w-[300px] animate-in fade-in slide-in-from-right-4 duration-300`}>
+        <div className={`${bgColors[toast.type]} border p-4 rounded-lg shadow-lg flex items-center gap-3 min-w-[300px] animate-fade-in animate-slide-in-from-right`}>
             {icons[toast.type]}
             <p className="text-sm font-medium flex-1 dark:text-gray-100">{toast.message}</p>
             <button onClick={() => onRemove(toast.id)} className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-200">

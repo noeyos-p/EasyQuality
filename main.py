@@ -554,12 +554,12 @@ async def process_save_document_task(
             print(f"  ⚠ Neo4j 업로드 실패 (무시): {ge}")
             
         elapsed = round(time.time() - start_time, 2)
-        update_task_status(task_id, "completed", f"문서 수정이 완료되었습니다. ({elapsed}초)", doc_id=doc_name, version=final_version)
+        update_task_status(task_id, "completed", f"문서 수정이 완료되었습니다. ({elapsed}초)", doc_name=doc_name, doc_id=doc_name, version=final_version)
         
     except Exception as e:
         import traceback
         traceback.print_exc()
-        update_task_status(task_id, "error", f"저장 중 오류 발생: {str(e)}")
+        update_task_status(task_id, "error", f"저장 중 오류 발생: {str(e)}", doc_name=doc_name)
 
 @app.post("/rag/document/save")
 async def save_document_content(request: SaveDocRequest, background_tasks: BackgroundTasks):
@@ -584,6 +584,53 @@ async def save_document_content(request: SaveDocRequest, background_tasks: Backg
         "task_id": task_id,
         "doc_name": request.doc_name
     }
+
+@app.post("/rag/upload-docx")
+async def upload_docx(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    doc_name: str = Form(...),
+    collection: str = Form("documents"),
+    model: str = Form("multilingual-e5-small"),
+    version: str = Form("1.0")
+):
+    """
+    DOCX 파일 업로드 및 분석 (비동기)
+    """
+    try:
+        content = await file.read()
+        filename = file.filename
+        
+        task_id = f"upload_docx_{uuid.uuid4().hex[:8]}"
+        # doc_name을 filename 대신 사용하여 알림에서 문서 ID가 보이게 함
+        update_task_status(task_id, "waiting", f"'{doc_name}' 업로드 요청이 접수되었습니다.", doc_name=doc_name, filename=filename)
+
+        # 기존 업로드 태스크 재사용 (DOCX도 동일 파이프라인 사용 가능하도록 유도)
+        background_tasks.add_task(
+            process_upload_task,
+            filename=doc_name, # 파이프라인에서 doc_id로 사용됨
+            content=content,
+            collection=collection,
+            chunk_size=500, # 기본값
+            chunk_method="article",
+            model=model,
+            overlap=50,
+            use_langgraph=True,
+            use_llm_metadata=True,
+            task_id=task_id,
+            version=version,
+        )
+
+        return {
+            "success": True,
+            "message": f"'{doc_name}' 문서의 업로드가 시작되었습니다.",
+            "task_id": task_id,
+            "doc_name": doc_name
+        }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, f"🔴 DOCX 업로드 요청 실패: {str(e)}")
 
 
 
@@ -864,7 +911,7 @@ def process_upload_task(
         # 완료
         # ========================================
         elapsed = round(time.time() - start_time, 2)
-        update_task_status(task_id, "completed", f"문서 업로드가 완료되었습니다. ({elapsed}초)", doc_id=doc_id, version=final_version)
+        update_task_status(task_id, "completed", f"문서 업로드가 완료되었습니다. ({elapsed}초)", doc_id=doc_id, doc_name=doc_id, filename=filename, version=final_version)
 
         print(f"{'='*70}", flush=True)
         print(f"🟢 업로드 처리 완료 ({elapsed}초)", flush=True)
@@ -872,13 +919,13 @@ def process_upload_task(
 
     except HTTPException as e:
         print(f"🔴 업로드 처리 실패: {e.detail}", flush=True)
-        update_task_status(task_id, "error", f"업로드 처리 실패: {e.detail}")
+        update_task_status(task_id, "error", f"업로드 처리 실패: {e.detail}", filename=filename)
         return
     except Exception as e:
         import traceback
         traceback.print_exc()
         print(f"🔴 업로드 처리 실패: {str(e)}", flush=True)
-        update_task_status(task_id, "error", f"알 수 없는 오류 발생: {str(e)}")
+        update_task_status(task_id, "error", f"알 수 없는 오류 발생: {str(e)}", filename=filename)
         return
 
 

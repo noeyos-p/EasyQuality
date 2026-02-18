@@ -240,8 +240,9 @@ export default function DocumentManagementPanel({ onDocumentSelect, onNotify, on
       if (response.ok) {
         const data = await response.json();
         if (data.success) {
-          alert(`선택한 문서 ${targets.length}개 삭제 완료`);
-          if (onNotify) onNotify(`문서 ${targets.length}개 삭제 완료`, 'success');
+          if (onNotify) {
+            onNotify(`문서 ${targets.length}개 삭제가 완료되었습니다.`, 'success');
+          }
         } else {
           const failed = data.failed_count ?? 0;
           const failedItems = Array.isArray(data.results)

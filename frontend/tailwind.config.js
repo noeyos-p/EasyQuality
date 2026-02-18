@@ -27,6 +27,20 @@ export default {
       fontFamily: {
         sans: ['-apple-system', 'BlinkMacSystemFont', 'Segoe UI', 'Helvetica', 'Arial', 'sans-serif'],
       },
+      keyframes: {
+        fadeIn: {
+          '0%': { opacity: '0' },
+          '100%': { opacity: '1' },
+        },
+        slideInFromRight: {
+          '0%': { transform: 'translateX(1rem)' },
+          '100%': { transform: 'translateX(0)' },
+        },
+      },
+      animation: {
+        'fade-in': 'fadeIn 300ms ease-out forwards',
+        'slide-in-from-right': 'slideInFromRight 300ms ease-out forwards',
+      },
     },
   },
   plugins: [],
