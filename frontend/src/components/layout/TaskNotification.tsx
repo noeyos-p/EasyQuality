@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { memo } from 'react';
 import { Loader2, CheckCircle2, AlertCircle, Clock } from 'lucide-react';
 
 export interface TaskStatus {
@@ -15,7 +15,7 @@ interface TaskNotificationProps {
     onCloseTask: (id: string) => void;
 }
 
-const TaskNotification: React.FC<TaskNotificationProps> = ({ tasks, onCloseTask }) => {
+const TaskNotification: React.FC<TaskNotificationProps> = memo(({ tasks, onCloseTask }) => {
     if (tasks.length === 0) return null;
 
     return (
@@ -24,8 +24,8 @@ const TaskNotification: React.FC<TaskNotificationProps> = ({ tasks, onCloseTask 
                 <div
                     key={task.id}
                     className={`bg-white dark:bg-gray-800 border-l-4 p-4 rounded-lg shadow-xl transform transition-all duration-300 ease-in-out border ${task.status === 'completed' ? 'border-l-green-500' :
-                            task.status === 'error' ? 'border-l-red-500' :
-                                task.status === 'processing' ? 'border-l-blue-500' : 'border-l-gray-400'
+                        task.status === 'error' ? 'border-l-red-500' :
+                            task.status === 'processing' ? 'border-l-blue-500' : 'border-l-gray-400'
                         }`}
                 >
                     <div className="flex justify-between items-start">
@@ -59,6 +59,6 @@ const TaskNotification: React.FC<TaskNotificationProps> = ({ tasks, onCloseTask 
             ))}
         </div>
     );
-};
+});
 
 export default TaskNotification;

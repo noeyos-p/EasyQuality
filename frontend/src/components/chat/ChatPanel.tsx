@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef, useEffect, memo } from 'react'
 import ChatMessageComponent from './ChatMessage'
 import InputArea from './InputArea'
 import type { ChatMessage } from '../../types'
@@ -9,8 +9,9 @@ interface ChatPanelProps {
   onDocumentSelect: (docId: string, docType?: string, clause?: string) => void
 }
 
-export default function ChatPanel({ isVisible, onDocumentSelect }: ChatPanelProps) {
+const ChatPanel = memo(function ChatPanel({ isVisible, onDocumentSelect }: ChatPanelProps) {
   const [messages, setMessages] = useState<ChatMessage[]>([])
+  // ... (기존 코드와 동일)
   const [inputMessage, setInputMessage] = useState('')
   const [isLoading, setIsLoading] = useState(false)
   const [sessionId, setSessionId] = useState<string | null>(null)
@@ -376,4 +377,6 @@ export default function ChatPanel({ isVisible, onDocumentSelect }: ChatPanelProp
       </div>
     </aside>
   )
-}
+})
+
+export default ChatPanel

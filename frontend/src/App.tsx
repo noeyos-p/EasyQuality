@@ -61,9 +61,9 @@ function App() {
     setToasts(prev => [...prev, { id, message, type }])
   }, [])
 
-  const removeToast = (id: string) => {
+  const removeToast = useCallback((id: string) => {
     setToasts(prev => prev.filter(t => t.id !== id))
-  }
+  }, [])
 
   // 🔄 백그라운드 작업 폴링 (Polling)
   useEffect(() => {
@@ -75,26 +75,34 @@ function App() {
         if (!res.ok) return;
         const currentTasks: TaskStatus[] = await res.json();
 
-        // 1. 새로운 완료/에러 상태 감지
-        currentTasks.forEach(task => {
-          const prevTask = prevTasksRef.current.find(t => t.id === task.id);
-          if (task.status === 'completed' && (!prevTask || prevTask.status !== 'completed')) {
-            const docName = task.filename || task.doc_name || '문서';
-            const msg = task.message || '작업이 성공적으로 처리되었습니다.';
-            addToast(`[성공] ${docName}: ${msg}`, 'success');
-            setRefreshCounter(c => c + 1);
-          }
-          else if (task.status === 'error' && (!prevTask || prevTask.status !== 'error')) {
-            const docName = task.filename || task.doc_name || '문서';
-            const msg = task.message || '처리 중 오류가 발생했습니다.';
-            addToast(`[오류] ${docName}: ${msg}`, 'error');
-          }
-        });
+        // 데이터가 실제로 변경되었는지 확인 (Deep Compare 대용으로 JSON stringify 사용)
+        const currentTasksStr = JSON.stringify(currentTasks);
+        const prevTasksStr = JSON.stringify(prevTasksRef.current);
 
-        // 2. Ref 업데이트 및 상태 반영
-        prevTasksRef.current = currentTasks;
-        const visibleTasks = currentTasks.filter(t => !closedTaskIds.has(t.id));
-        setActiveTasks(visibleTasks);
+        const isDataChanged = currentTasksStr !== prevTasksStr;
+
+        if (isDataChanged) {
+          // 1. 새로운 완료/에러 상태 감지
+          currentTasks.forEach(task => {
+            const prevTask = prevTasksRef.current.find(t => t.id === task.id);
+            if (task.status === 'completed' && (!prevTask || prevTask.status !== 'completed')) {
+              const docName = task.filename || task.doc_name || '문서';
+              const msg = task.message || '작업이 성공적으로 처리되었습니다.';
+              addToast(`[성공] ${docName}: ${msg}`, 'success');
+              setRefreshCounter(c => c + 1);
+            }
+            else if (task.status === 'error' && (!prevTask || prevTask.status !== 'error')) {
+              const docName = task.filename || task.doc_name || '문서';
+              const msg = task.message || '처리 중 오류가 발생했습니다.';
+              addToast(`[오류] ${docName}: ${msg}`, 'error');
+            }
+          });
+
+          // 2. Ref 업데이트 및 상태 반영 (데이터가 변했을 때만!)
+          prevTasksRef.current = currentTasks;
+          const visibleTasks = currentTasks.filter(t => !closedTaskIds.has(t.id));
+          setActiveTasks(visibleTasks);
+        }
       } catch (err) {
         console.error('Task polling error:', err);
       }
@@ -105,10 +113,10 @@ function App() {
     return () => clearInterval(interval);
   }, [isConnected, closedTaskIds, addToast]);
 
-  const handleCloseTask = (id: string) => {
+  const handleCloseTask = useCallback((id: string) => {
     setClosedTaskIds(prev => new Set(prev).add(id));
     setActiveTasks(prev => prev.filter(t => t.id !== id));
-  };
+  }, []);
 
   // 🔄 refreshCounter가 변경되면 (작업 완료 등) 현재 보는 문서도 갱신 시도
   useEffect(() => {
@@ -138,7 +146,7 @@ function App() {
     checkBackendStatus()
   }, [])
 
-  const handleDocumentSelect = async (docId: string, docType?: string, clause?: string) => {
+  const handleDocumentSelect = useCallback(async (docId: string, docType?: string, clause?: string) => {
     setSelectedDocument(docId)
     setSelectedClause(clause || null)
     setIsEditing(false)
@@ -202,7 +210,7 @@ function App() {
       console.error('OnlyOffice 초기화 오류:', error)
       setIsOnlyOfficeMode(false)
     }
-  }
+  }, [user])
 
   const handleCloseViewer = () => {
     setSelectedDocument(null)
