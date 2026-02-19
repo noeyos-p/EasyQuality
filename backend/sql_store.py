@@ -200,6 +200,13 @@ class SQLStore:
         try:
             with self._get_connection() as conn:
                 with conn.cursor() as cur:
+                    # 1. 만약 신규 버전의 상태가 "사용중"이라면, 기존의 "사용중"인 버전들을 "폐기"로 변경
+                    if status == "사용중":
+                        cur.execute(
+                            "UPDATE document SET status = '폐기', deprecated_at = NOW() WHERE doc_name_id = %s AND status = '사용중' AND version != %s",
+                            (doc_name_id, version)
+                        )
+
                     cur.execute(
                         "SELECT id FROM document WHERE doc_name_id = %s AND version = %s",
                         (doc_name_id, version)
@@ -630,6 +637,32 @@ class SQLStore:
             return True
         except Exception as e:
             print(f" [SQLStore] 문서 상태 변경 실패: {e}")
+            return False
+
+    def execute_data_correction(self) -> bool:
+        """기존 중복 '사용중' 문서들을 정리 (최신만 남기고 '폐기')"""
+        query = """
+            UPDATE document 
+            SET status = '폐기', deprecated_at = NOW()
+            WHERE status = '사용중' 
+              AND id NOT IN (
+                SELECT id FROM (
+                  SELECT id, ROW_NUMBER() OVER(PARTITION BY doc_name_id ORDER BY created_at DESC, version DESC) as rn 
+                  FROM document 
+                  WHERE status = '사용중'
+                ) t WHERE rn = 1
+              );
+        """
+        try:
+            with self._get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(query)
+                    count = cur.rowcount
+                    conn.commit()
+            print(f" [SQLStore] 데이터 보정 완료: {count}개 버전을 '폐기'로 변경")
+            return True
+        except Exception as e:
+            print(f" [SQLStore] 데이터 보정 실패: {e}")
             return False
 
     # Users 테이블 관련 메서드
