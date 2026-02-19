@@ -33,7 +33,7 @@ Answer user questions based on conversation history (History) and [related past 
     try:
         client = get_openai_client()
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4o",
             messages=[
                 {"role": "system", "content": system_instruction},
                 *messages

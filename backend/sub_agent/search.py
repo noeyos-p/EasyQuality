@@ -648,7 +648,7 @@ def retrieval_agent_node(state: Dict[str, Any]) -> Dict[str, Any]:
     # 모델 정보 확인
     worker_model = state.get("worker_model")
     model_name = state.get("model_name")
-    final_model = worker_model or model_name or "gpt-4o-mini"
+    final_model = worker_model or model_name or "gpt-4o"
     print(f"[DEBUG retrieval] model={final_model}")
 
     initial_state = {

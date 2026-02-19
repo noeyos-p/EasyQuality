@@ -2,7 +2,7 @@
 RAG 챗봇 API v14.0 + Agent (OpenAI)
 
  v14.0 변경사항:
-- LLM 백엔드 변경: Z.AI → OpenAI GPT-4o-mini
+- LLM 백엔드 변경: Z.AI → OpenAI GPT 계열
 - 에이전트 시스템 통합 (모든 서브 에이전트 OpenAI 사용)
 - LLM as a Judge 평가 시스템 (RDB 검증 포함)
 - LangSmith 추적 지원 및 최적화
@@ -59,6 +59,11 @@ DEFAULT_CHUNK_METHOD = "article"
 DEFAULT_N_RESULTS = 7
 DEFAULT_SIMILARITY_THRESHOLD = 0.30
 USE_LANGGRAPH = True
+FORCED_LLM_MODEL = "gpt-4o"
+
+def resolve_effective_llm_model(requested_model: Optional[str]) -> str:
+    """클라이언트 요청값과 무관하게 서버 모델을 gpt-4o로 고정."""
+    return FORCED_LLM_MODEL
 
 class SearchRequest(BaseModel):
     query: str
@@ -75,7 +80,7 @@ class ChatRequest(BaseModel):
     collection: str = "documents"
     n_results: int = DEFAULT_N_RESULTS
     embedding_model: str = "multilingual-e5-small"
-    llm_model: str = "gpt-4o-mini"
+    llm_model: str = "gpt-4o"
     llm_backend: str = "openai"
     filter_doc: Optional[str] = None
     similarity_threshold: Optional[float] = None
@@ -85,7 +90,7 @@ class AskRequest(BaseModel):
     collection: str = "documents"
     n_results: int = DEFAULT_N_RESULTS
     embedding_model: str = "multilingual-e5-small"
-    llm_model: str = "gpt-4o-mini"
+    llm_model: str = "gpt-4o"
     llm_backend: str = "openai"
     temperature: float = 0.7
     filter_doc: Optional[str] = None
@@ -769,7 +774,7 @@ def process_upload_task(
         print(f"  파이프라인: PDF 조항 v2.0", flush=True)
         print(f"  LLM 메타데이터: {'🟢 활성' if use_llm_metadata else '비활성'}", flush=True)
         if use_llm_metadata:
-            print(f"  LLM 모델: gpt-4o-mini", flush=True)
+            print(f"  LLM 모델: gpt-4o", flush=True)
         print("", flush=True)
 
         model_path = resolve_model_path(model)
@@ -1039,11 +1044,14 @@ async def process_chat_request(request: ChatRequest) -> Dict:
             import traceback
             traceback.print_exc()
 
+    effective_model = resolve_effective_llm_model(request.llm_model)
+    print(f" [LLM] effective_model={effective_model} (requested={request.llm_model})")
+
     response = await asyncio.to_thread(
         run_agent,
         query=request.message,
         session_id=session_id,
-        model_name=request.llm_model or "gpt-4o-mini",
+        model_name=effective_model,
         chat_history=chat_history
     )
 
@@ -1082,7 +1090,7 @@ async def process_chat_request(request: ChatRequest) -> Dict:
     try:
         from backend.evaluation import AgentEvaluator
         if len(answer) >= 20 and not is_error_message:
-            evaluator = AgentEvaluator(judge_model="gpt-4o-mini", sql_store=sql_store)
+            evaluator = AgentEvaluator(judge_model="gpt-4o", sql_store=sql_store)
             context = response.get("agent_log", {}).get("context", "")
             if isinstance(context, list):
                 context = "\n\n".join(context)
@@ -1251,9 +1259,11 @@ async def chat(chat_request: ChatRequest, http_request: Request):
         auth_header = http_request.headers.get("Authorization")
         user_id = _extract_user_id_from_auth_header(auth_header)
 
+    effective_model = resolve_effective_llm_model(chat_request.llm_model)
     queued_request = chat_request.model_copy(update={
         "session_id": session_id,
-        "user_id": user_id
+        "user_id": user_id,
+        "llm_model": effective_model
     })
 
     # 핵심: 큐 등록은 공통 함수 사용
@@ -2315,7 +2325,7 @@ class AgentRequest(BaseModel):
     """에이전트 요청"""
     message: str
     session_id: Optional[str] = None
-    llm_model: str = "gpt-4o-mini"
+    llm_model: str = "gpt-4o"
     embedding_model: str = "multilingual-e5-small" # 추가
     n_results: int = DEFAULT_N_RESULTS #  추가
     use_langgraph: bool = True  # LangGraph 에이전트 사용 여부
@@ -2333,10 +2343,11 @@ async def agent_chat(request: AgentRequest):
         raise HTTPException(500, "에이전트 모듈이 로드되지 않았습니다")
     
     session_id = request.session_id or str(uuid.uuid4())
-    
+
     # 기존 run_agent() 직접 호출 대신 큐에 넣기
     payload = request.model_dump()
     payload["session_id"] = session_id
+    payload["llm_model"] = resolve_effective_llm_model(request.llm_model)
 
     return await enqueue_job(
         kind="agent",
@@ -2416,7 +2427,7 @@ def evaluate_answer(request: EvaluationRequest):
 
         # RDB 검증을 위해 sql_store 필수 전달
         evaluator = AgentEvaluator(
-            judge_model="gpt-4o-mini",
+            judge_model="gpt-4o",
             sql_store=sql_store
         )
 
@@ -3163,7 +3174,7 @@ def main():
     print("\n" + "=" * 60)
     print(" RAG Chatbot API v14.0 + OpenAI Agent")
     print("=" * 60)
-    print(f" LLM 백엔드: OpenAI (GPT-4o-mini)")
+    print(f" LLM 백엔드: OpenAI (gpt-4o)")
     print(f" 에이전트: {' 활성화' if LANGGRAPH_AVAILABLE else ' 비활성화'}")
     
     if LANGGRAPH_AVAILABLE:

@@ -1,7 +1,7 @@
 """
 SOP 멀티 에이전트 시스템 v14.0
-- Orchestrator (Main): OpenAI (GPT-4o-mini) - 질문 분석 및 라우팅, 최종 답변
-- Specialized Sub-Agents: OpenAI (GPT-4o-mini) - 실행 및 데이터 처리
+- Orchestrator (Main): OpenAI (GPT 계열) - 질문 분석 및 라우팅, 최종 답변
+- Specialized Sub-Agents: OpenAI (GPT 계열) - 실행 및 데이터 처리
   1. Retrieval Agent: 문서 검색 및 추출
   2. Summarization Agent: 문서/조항 요약
   3. Comparison Agent: 버전 비교
@@ -115,7 +115,7 @@ def get_openai_client():
 
 _langchain_llm = None
 
-def get_langchain_llm(model: str = "gpt-4o-mini", temperature: float = 0.0):
+def get_langchain_llm(model: str = "gpt-4o", temperature: float = 0.0):
     """LangChain ChatOpenAI 반환 (LangSmith 추적용)"""
     if ChatOpenAI is None:
         raise ImportError("langchain-openai 패키지가 설치되지 않았거나 로드할 수 없습니다.")
@@ -330,7 +330,7 @@ class AgentState(TypedDict):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def orchestrator_node(state: AgentState):
-    """메인 에이전트 (OpenAI GPT-4o-mini) - 질문 분석 및 라우팅"""
+    """메인 에이전트 (OpenAI GPT) - 질문 분석 및 라우팅"""
 
     # 추적 정보 초기화
     agent_calls = state.get("agent_calls") or {}
@@ -424,7 +424,7 @@ You direct sub-agents to resolve user questions and verify reported results.
 
     try:
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4o",
             messages=[
                 {"role": "system", "content": system_prompt},
                 *messages,
@@ -554,8 +554,8 @@ def run_agent(query: str, session_id: str = "default", model_name: str = None, e
         "query": query,
         "messages": messages,
         "next_agent": "orchestrator",
-        "worker_model": model_name or "gpt-4o-mini",
-        "orchestrator_model": "gpt-4o-mini",
+        "worker_model": model_name or "gpt-4o",
+        "orchestrator_model": "gpt-4o",
         "model_name": model_name,
         "loop_count": 0,
         "agent_calls": {},  # 에이전트 호출 추적

@@ -28,7 +28,7 @@ def comparison_agent_node(state: AgentState):
     """[서브] 비교 에이전트 - 버전 목록 조회 또는 내용 비교 분석"""
     print(f"[COMPARISON AGENT] 진입! query={state.get('query')}")
     query = state["query"]
-    model = state.get("worker_model") or state.get("model_name") or "gpt-4o-mini"
+    model = state.get("worker_model") or state.get("model_name") or "gpt-4o"
 
     # 1. 의도 분석 (LangChain ChatOpenAI 사용 - LangSmith 자동 추적)
     # 사용자가 버전 목록을 보고 싶어하는지, 아니면 실제 내용 비교를 원하는지 구분

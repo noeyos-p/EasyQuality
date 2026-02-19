@@ -53,7 +53,7 @@ def generate_mermaid_flow(doc_id: str, refs: dict, impact_data: list = None) -> 
 def graph_agent_node(state: AgentState):
     """[서브] 그래프 에이전트 (OpenAI) - 인텐트 분석 및 시각화 지원"""
     query = state["query"]
-    model = state.get("worker_model") or state.get("model_name") or "gpt-4o-mini"
+    model = state.get("worker_model") or state.get("model_name") or "gpt-4o"
 
     # 1. 의도 및 엔티티 추출 (LangChain ChatOpenAI 사용 - LangSmith 자동 추적)
     messages = state.get("messages", [])

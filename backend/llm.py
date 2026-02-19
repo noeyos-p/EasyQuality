@@ -21,7 +21,7 @@ _loaded_llm: Dict[str, Any] = {}
 class OpenAILLM:
     """OpenAI API"""
 
-    def __init__(self, model: str = "gpt-4o-mini", api_key: str = None):
+    def __init__(self, model: str = "gpt-4o", api_key: str = None):
         self.model = model
         self.api_key = api_key or os.getenv("OPENAI_API_KEY", "")
         self._client = None
@@ -417,7 +417,7 @@ def generate_with_hf(
 
 def get_llm_response(
     prompt: str,
-    llm_model: str = "gpt-4o-mini", # 기본값: OpenAI
+    llm_model: str = "gpt-4o", # 기본값: OpenAI
     llm_backend: str = "openai", # openai | zai | ollama
     max_tokens: int = 1024,
     temperature: float = 0.7
@@ -434,7 +434,7 @@ def get_llm_response(
         return llm.generate(prompt, temperature=temperature, max_tokens=max_tokens)
     elif llm_backend == "openai":
          # OpenAI는 별도 클래스 없이 간단하게 처리하거나 OpenAILLM 클래스 활용
-        llm = OpenAILLM(llm_model if not llm_model.startswith("glm") else "gpt-4o-mini")
+        llm = OpenAILLM(llm_model if not llm_model.startswith("glm") else "gpt-4o")
         return llm.generate(prompt, temperature=temperature, max_tokens=max_tokens)
     else:
         return generate_with_hf(prompt, llm_model, max_tokens, temperature)
