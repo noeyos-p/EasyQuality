@@ -2,6 +2,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 import json
 import os
+import re
 from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 
@@ -405,6 +406,54 @@ class SQLStore:
         """두 버전 간의 조항 단위 비교 (Added, Deleted, Modified)"""
         print(f"[SQLStore] 조항 비교 시작: {doc_name} v{v1} vs {v2}")
 
+        def _normalize_for_diff(text: str) -> str:
+            """문서 비교용 정규화: 포맷 노이즈만 최소한으로 제거"""
+            if not text:
+                return ""
+            raw = str(text)
+            t = raw.lower()
+
+            # 문서 본문 이후 붙는 승인/개정 로그는 비교 대상에서 제외
+            tail_markers = [
+                "*end of document*",
+                "document revision history",
+                "문서개정이력",
+                "document approvals",
+                "approved date",
+            ]
+            cut_pos = -1
+            for marker in tail_markers:
+                p = t.find(marker)
+                if p != -1 and (cut_pos == -1 or p < cut_pos):
+                    cut_pos = p
+            if cut_pos != -1:
+                t = t[:cut_pos]
+
+            # 전자결재/서명/이메일/타임스탬프류 노이즈 제거
+            t = re.sub(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', ' ', t)
+            t = re.sub(r'\b\d{4}-\d{2}-\d{2}\b', ' ', t)
+            t = re.sub(r'\b\d{1,2}[-/]\w{3}[-/]\d{4}\b', ' ', t)
+            t = re.sub(r'\b\d{1,2}:\d{2}:\d{2}\b', ' ', t)
+            t = re.sub(r'gmt[+\-]?\d*', ' ', t)
+
+            # 승인 워크플로우/결재 로그 라인 제거
+            t = re.sub(r'\btask\s*:\s*approval task\b.*', ' ', t)
+            t = re.sub(r'\bverdict\s*:\s*approve\b.*', ' ', t)
+            t = re.sub(r'\bproduction manager\b.*', ' ', t)
+            t = re.sub(r'\bquality manager\b.*', ' ', t)
+            t = re.sub(r'본 문서의 전자서명 날짜.*', ' ', t)
+
+            # 공백/기호 정규화
+            t = re.sub(r'\s+', ' ', t)
+            return t.strip()
+
+        def _token_set(text: str) -> set:
+            """순서/중복 영향을 줄이기 위한 비교 토큰 집합"""
+            if not text:
+                return set()
+            cleaned = re.sub(r'[^0-9a-z가-힣]+', ' ', text.lower())
+            return {tok for tok in cleaned.split() if len(tok) >= 2}
+
         # v1 문서 ID 조회
         doc1 = self.get_document_by_name(doc_name, v1)
         if not doc1: return [{"error": f"v{v1} 버전을 찾을 수 없습니다."}]
@@ -415,21 +464,53 @@ class SQLStore:
 
         # 조항별로 content를 병합한 후 비교
         query = """
-            WITH v1_clauses AS (
+            WITH v1_clauses_raw AS (
                 SELECT
                     clause,
-                    STRING_AGG(content, ' ' ORDER BY id) as content
+                    -- 조항 매핑 키:
+                    -- 1) 숫자 계층 조항(예: 4.1.2) 우선 매핑
+                    -- 2) 비숫자 조항은 공백 정규화 후 텍스트 매핑
+                    -- 3) 빈값/일반 라벨(N/A 등)은 id 기반 고유 키로 분리
+                    CASE
+                        WHEN clause IS NULL OR TRIM(clause) = '' THEN CONCAT('__NOCLAUSE__:', id::text)
+                        WHEN REGEXP_MATCH(clause, '(\\d+(?:\\.\\d+)*)') IS NOT NULL THEN (REGEXP_MATCH(clause, '(\\d+(?:\\.\\d+)*)'))[1]
+                        WHEN LOWER(TRIM(clause)) IN ('n/a', 'na', 'none', 'null', '-', 'clause', 'section', 'article', 'body', 'text') THEN CONCAT('__GENERIC__:', id::text)
+                        ELSE LOWER(REGEXP_REPLACE(TRIM(clause), '\\s+', ' ', 'g'))
+                    END AS clause_key,
+                    content,
+                    id
                 FROM chunk
                 WHERE document_id = %s AND clause IS NOT NULL
-                GROUP BY clause
+            ),
+            v1_clauses AS (
+                SELECT
+                    MIN(clause) AS clause,
+                    clause_key,
+                    STRING_AGG(content, ' ' ORDER BY id) as content
+                FROM v1_clauses_raw
+                GROUP BY clause_key
+            ),
+            v2_clauses_raw AS (
+                SELECT
+                    clause,
+                    CASE
+                        WHEN clause IS NULL OR TRIM(clause) = '' THEN CONCAT('__NOCLAUSE__:', id::text)
+                        WHEN REGEXP_MATCH(clause, '(\\d+(?:\\.\\d+)*)') IS NOT NULL THEN (REGEXP_MATCH(clause, '(\\d+(?:\\.\\d+)*)'))[1]
+                        WHEN LOWER(TRIM(clause)) IN ('n/a', 'na', 'none', 'null', '-', 'clause', 'section', 'article', 'body', 'text') THEN CONCAT('__GENERIC__:', id::text)
+                        ELSE LOWER(REGEXP_REPLACE(TRIM(clause), '\\s+', ' ', 'g'))
+                    END AS clause_key,
+                    content,
+                    id
+                FROM chunk
+                WHERE document_id = %s AND clause IS NOT NULL
             ),
             v2_clauses AS (
                 SELECT
-                    clause,
+                    MIN(clause) AS clause,
+                    clause_key,
                     STRING_AGG(content, ' ' ORDER BY id) as content
-                FROM chunk
-                WHERE document_id = %s AND clause IS NOT NULL
-                GROUP BY clause
+                FROM v2_clauses_raw
+                GROUP BY clause_key
             )
             SELECT
                 COALESCE(v2.clause, v1.clause) as clause,
@@ -442,7 +523,7 @@ class SQLStore:
                 v1.content as v1_content,
                 v2.content as v2_content
             FROM v1_clauses v1
-            FULL OUTER JOIN v2_clauses v2 ON v1.clause = v2.clause
+            FULL OUTER JOIN v2_clauses v2 ON v1.clause_key = v2.clause_key
             ORDER BY COALESCE(v2.clause, v1.clause)
         """
 
@@ -454,8 +535,50 @@ class SQLStore:
                     rows = cur.fetchall()
 
                     for row in rows:
-                        if row['change_type'] != 'UNCHANGED':
-                            diffs.append(dict(row))
+                        if row['change_type'] == 'UNCHANGED':
+                            continue
+
+                        item = dict(row)
+                        change_type = item.get('change_type')
+
+                        # ADDED/DELETED 판정 보정:
+                        # 본문 없이 placeholder(N/A 등)만 있는 경우는 제외
+                        if change_type in ('ADDED', 'DELETED'):
+                            raw_text = item.get('v2_content') if change_type == 'ADDED' else item.get('v1_content')
+                            normalized = _normalize_for_diff(raw_text or "")
+                            if normalized in {"", "n/a", "na", "none", "null", "-"}:
+                                continue
+
+                        # MODIFIED 판정 보정:
+                        # 포맷/개행/서명 등 비본질 차이는 변경으로 보지 않음
+                        if change_type == 'MODIFIED':
+                            v1_raw = item.get('v1_content') or ""
+                            v2_raw = item.get('v2_content') or ""
+                            n1 = _normalize_for_diff(v1_raw)
+                            n2 = _normalize_for_diff(v2_raw)
+
+                            if n1 == n2:
+                                continue
+
+                            # 중복 chunk/순서 차이/OCR 분할 차이 보정
+                            t1 = _token_set(n1)
+                            t2 = _token_set(n2)
+                            if t1 and t2:
+                                only1 = t1 - t2
+                                only2 = t2 - t1
+
+                                # 토큰 집합이 동일하면 내용 동일로 간주
+                                if not only1 and not only2:
+                                    continue
+
+                                # 미세한 꼬리 잘림/기호 노이즈(1토큰 이내)는 무시
+                                inter = len(t1 & t2)
+                                union = len(t1 | t2) or 1
+                                jaccard = inter / union
+                                if jaccard >= 0.94 and (len(only1) + len(only2)) <= 1:
+                                    continue
+
+                        diffs.append(item)
 
             return diffs
         except Exception as e:

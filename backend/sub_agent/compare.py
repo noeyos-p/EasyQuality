@@ -167,7 +167,8 @@ Question: {query}
                  return {"context": [f"### [비교 에이전트 오류]\n{doc_id}의 지정된 버전({v1}, {v2}) 데이터를 가져올 수 없습니다. [DONE]"]}
 
             # 3. 종합 분석 (Z.AI)
-            analysis_prompt = f"""Based on the change details (Diff) and impact analysis (Impact) data of the two versions, write a fact-based report.
+            analysis_prompt = f"""Using the change data (Diff) and impact data (Impact) below, write a factual comparison report.
+The final answer must be written in Korean.
 
 [Change Clause Data]
 {comp_data}
@@ -176,35 +177,35 @@ Question: {query}
 {impact_data}
 
 ## Rules
+1. Use only clauses present in [Change Clause Data]. Do not add assumptions.
+2. Use the section titles exactly as shown in the output format below.
+3. In section 2, each item must be in `- 조항 x.x` format and include both `변경 전:` and `변경 후:`.
+4. Section 1 must be a concise 2-3 sentence summary.
+5. The last line of the response must be exactly `[DONE]` and appear only once.
 
-1. Only describe the clauses listed in the [Change Clause Data] above. Do not add content not present in the data.
-2. No markdown (#, **, ---, *, - bullets are all prohibited). Use only '1.' format for numbering.
-3. There must be a line break between "Before:" and "After:".
+## Output Format (must follow exactly)
+1. 변경 핵심 요약
+(2~3문장 요약)
 
-## Report Format (follow this structure exactly)
+2. 상세 비교
+- 조항 4.1
+  변경 전: ...
+  변경 후: ...
+- 조항 4.2
+  변경 전: ...
+  변경 후: ...
 
-1. Key Change Summary
-(Summarize the number of changed clauses and the main direction of changes in 2-3 sentences)
-
-2. Detailed Comparison
-
-[Clause 4.1]
-Before: (content before the change)
-After: (content after the change)
-
-[Clause 4.2]
-Before: (content before the change)
-After: (content after the change)
-
-3. Impact Assessment
-(List the affected documents and the reasons)
-
+3. 영향 평가
+(영향 문서와 이유를 구체적으로 기술)
 [DONE]"""
             
             try:
                 # LangChain ChatOpenAI 사용
                 llm = get_langchain_llm(model=model, temperature=0.0)
-                res = llm.invoke([{"role": "user", "content": analysis_prompt}])
+                res = llm.invoke([
+                    {"role": "system", "content": "당신은 문서 변경 비교 보고서 작성기입니다. 모든 답변은 반드시 한국어로만 작성하세요."},
+                    {"role": "user", "content": analysis_prompt}
+                ])
 
                 final_report = res.content
 

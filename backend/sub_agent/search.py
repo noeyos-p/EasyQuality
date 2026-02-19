@@ -469,6 +469,10 @@ def tool_executor_node(state: SearchState):
 
             # v8.4: 문서 ID 정규화 (eEQ- -> EQ-)
             target_doc_id = normalize_doc_id(tool_args.get("target_doc_id"))
+            # LLM이 target_doc_id를 누락해도, 질문에서 감지된 ID가 있으면 강제 주입
+            if not target_doc_id and state.get("detected_doc_id"):
+                target_doc_id = normalize_doc_id(state.get("detected_doc_id"))
+                print(f"    [Deep Search] 감지된 문서 ID 강제 적용: {target_doc_id}")
 
             print(f"    [Deep Search] 도구 호출: '{query}' (키워드: {keywords}, 타겟조항: {target_clause}, 타겟문서: {target_doc_id or '전체'})")
 
@@ -674,6 +678,43 @@ def retrieval_agent_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
     # 참고문헌 섹션 자동 추가
     final_msg_with_refs = _ensure_reference_section(result["messages"], final_msg)
+
+    # 복구 로직:
+    # LLM이 NO_INFO를 반환했더라도, tool 결과에 [DATA_SOURCE]가 있으면
+    # 검색된 근거를 바탕으로 최소 답변을 생성해 파이프라인 단절을 방지
+    has_no_info = (
+        "No relevant information found within the searched documents." in final_msg_with_refs
+        or "[NO_INFO_FOUND]" in final_msg_with_refs
+        or "검색된 정보가 없습니다" in final_msg_with_refs
+    )
+    if has_no_info:
+        recovered_sources = []
+        for msg in result["messages"]:
+            if isinstance(msg, dict) and msg.get("role") == "tool":
+                tool_content = msg.get("content", "")
+            elif hasattr(msg, "role") and msg.role == "tool":
+                tool_content = getattr(msg, "content", "")
+            else:
+                continue
+
+            hits = re.findall(
+                r'\[DATA_SOURCE\]\s*문서 정보:\s*([^\n]+)\s*해당 조항:\s*([^\n]+)\s*본문 내용:\s*(.*?)\s*\[END_SOURCE\]',
+                tool_content,
+                re.MULTILINE | re.DOTALL
+            )
+            for doc_name, clause, body in hits[:5]:
+                body = re.sub(r'\s+', ' ', (body or '').strip())
+                if not body:
+                    continue
+                recovered_sources.append((doc_name.strip(), clause.strip(), body[:300]))
+
+        if recovered_sources:
+            lines = []
+            for doc_name, clause, body in recovered_sources[:3]:
+                lines.append(f"{doc_name}의 {clause}에 따르면 {body}[USE: {doc_name} | {clause}]")
+            lines.append("[DONE]")
+            final_msg_with_refs = "\n".join(lines)
+            print(f"🟡 [Deep Search] NO_INFO 복구 적용: {len(recovered_sources)}건 소스 기반 최소 답변 생성")
 
     # [중요] 답변 에이전트 도입을 위해 직접 답변하지 않고 context에 보고서 형태로 저장 (리스트 형태로 반환하여 누적)
     report = f"### [검색 에이전트 조사 최종 보고]\n{final_msg_with_refs}"
