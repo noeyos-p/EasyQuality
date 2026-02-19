@@ -167,25 +167,25 @@ Question: {query}
                  return {"context": [f"### [비교 에이전트 오류]\n{doc_id}의 지정된 버전({v1}, {v2}) 데이터를 가져올 수 없습니다. [DONE]"]}
 
             # 3. 종합 분석 (Z.AI)
-            analysis_prompt = f"""Using the change data (Diff) and impact data (Impact) below, write a factual comparison report.
-The final answer must be written in Korean.
+            analysis_prompt = f"""당신은 GMP 규정 전문 분석가입니다. 아래의 변경 데이터(Diff)와 영향 분석 데이터(Impact)를 바탕으로 전문적이고 사실 중심적인 '문서 변경 비교 보고서'를 작성하세요.
 
-[Change Clause Data]
+[변경 조항 데이터 (Diff)]
 {comp_data}
 
-[Impact Analysis Data]
+[영향 분석 데이터 (Impact)]
 {impact_data}
 
-## Rules
-1. Use only clauses present in [Change Clause Data]. Do not add assumptions.
-2. Use the section titles exactly as shown in the output format below.
-3. In section 2, each item must be in `- 조항 x.x` format and include both `변경 전:` and `변경 후:`.
-4. Section 1 must be a concise 2-3 sentence summary.
-5. The last line of the response must be exactly `[DONE]` and appear only once.
+## 보고서 작성 지침
+1. **사실 근거**: 반드시 로우 데이터([변경 조항 데이터])에 존재하는 정보만 사용하세요. 추측이나 허구의 내용을 지항하세요.
+2. **요약 섹션**: '1. 변경 핵심 요약'에는 전체 변경 사항의 핵심을 전문적인 용어를 사용하여 2~3문장으로 명확하게 요약하세요.
+3. **탐색적 비교**: '2. 상세 비교' 섹션에서는 각 변경된 조항을 `- 조항 X.X` 형식의 헤더로 구분하고, `변경 전:`과 `변경 후:`를 명확히 대조하여 기술하세요.
+4. **영향 평가**: '3. 영향 평가' 섹션에는 제공된 영향 분석 데이터를 바탕으로, 이 변경이 다른 문서나 프로세스에 미칠 구체적인 파급 효과를 분석하여 기술하세요.
+5. **언어**: 모든 내용은 반드시 한국어로 작성하세요.
+6. **종료 태그**: 답변의 가장 마지막 줄에는 반드시 `[DONE]` 태그만을 포함하세요.
 
-## Output Format (must follow exactly)
+## 출력 형식 (반드시 준수)
 1. 변경 핵심 요약
-(2~3문장 요약)
+(전체 내용을 관통하는 전문적인 요약 2~3문장)
 
 2. 상세 비교
 - 조항 4.1
@@ -196,7 +196,7 @@ The final answer must be written in Korean.
   변경 후: ...
 
 3. 영향 평가
-(영향 문서와 이유를 구체적으로 기술)
+(영향을 받는 문서명과 구체적인 영향 사유 기술)
 [DONE]"""
             
             try:
