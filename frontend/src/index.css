@@ -105,15 +105,18 @@ body {
 
 .response-body li {
   margin-bottom: 8px;
+  list-style-position: outside;
+  padding-left: 20px;
 }
 
 .response-body li>p,
 .response-body li>div {
-  display: inline;
+  display: block;
 }
 
 .response-body p {
   margin-bottom: 12px;
+  white-space: pre-wrap;
 }
 
 .response-body p:last-child {
