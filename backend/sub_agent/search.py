@@ -741,10 +741,14 @@ def retrieval_agent_node(state: Dict[str, Any]) -> Dict[str, Any]:
                     continue
                 # 제목만 반복되는 헤더성 청크는 제외 (실질 내용이 50자 미만이면 스킵)
                 # 예: "목적 Purpose 목적 Purpose" 같은 내용 필터링
-                clean_body = re.sub(r'\[상세\]\s*', '', body).strip()
+                clean_body = re.sub(r'\[하위 조항 [^\]]*\]\s*', '', body)
+                clean_body = re.sub(r'\[상세\]\s*', '', clean_body).strip()
                 if len(clean_body) < 50:
                     continue
-                recovered_sources.append((doc_name.strip(), clause.strip(), body[:300]))
+                # 답변에 포함될 body에서 하위 조항 태그 제거
+                clean_body_for_answer = re.sub(r'\[하위 조항 [^\]]*\]\s*', '', body)
+                clean_body_for_answer = re.sub(r'\[상세\]\s*', '', clean_body_for_answer).strip()
+                recovered_sources.append((doc_name.strip(), clause.strip(), clean_body_for_answer[:300]))
 
         if recovered_sources:
             lines = []

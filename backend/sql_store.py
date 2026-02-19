@@ -448,11 +448,11 @@ class SQLStore:
             return t.strip()
 
         def _token_set(text: str) -> set:
-            """순서/중복 영향을 줄이기 위한 비교 토큰 집합"""
+            """비교용 토큰 집합 (한글 1글자 포함)"""
             if not text:
                 return set()
             cleaned = re.sub(r'[^0-9a-z가-힣]+', ' ', text.lower())
-            return {tok for tok in cleaned.split() if len(tok) >= 2}
+            return {tok for tok in cleaned.split() if tok}
 
         # v1 문서 ID 조회
         doc1 = self.get_document_by_name(doc_name, v1)
