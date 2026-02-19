@@ -245,27 +245,60 @@ def search_documents_internal(
                     # 제목성 청크(내용이 너무 짧음)인 경우 또는 점수가 매우 높은 경우 하위 내용 확장
                     if _sql_store and (len(r["content"]) < 100 or r["score"] > 0.8):
                         try:
-                            doc_id_val = r["meta"].get("doc_id") or r["meta"].get("id")
-                            if doc_id_val:
-                                all_chunks = _sql_store.get_chunks_by_document(doc_id_val)
-                                current_idx = -1
-                                # 현재 청크의 위치 찾기
-                                for idx, c in enumerate(all_chunks):
-                                    if c.get("content") == r["content"]:
-                                        current_idx = idx
-                                        break
-                                
-                                # 다음 3개 청크를 '상세 내용'으로 병합
-                                if current_idx != -1:
+                            # doc_id 메타는 문자열(예: "EQ-SOP-00001")이므로
+                            # SQL의 numeric document_id로 변환 필요
+                            doc_name_val = (
+                                r["meta"].get("doc_id") or
+                                r["meta"].get("doc_name") or
+                                r.get("doc_name")
+                            )
+                            if doc_name_val:
+                                doc_record = _sql_store.get_document_by_name(doc_name_val)
+                                if doc_record:
+                                    numeric_doc_id = doc_record['id']
+                                    all_chunks = _sql_store.get_chunks_by_document(numeric_doc_id)
+
+                                    current_section = r["section"]
                                     extra_content = ""
-                                    for i in range(1, 4):
-                                        if current_idx + i < len(all_chunks):
-                                            next_c = all_chunks[current_idx + i]
-                                            extra_content += f"\n[상세] {next_c.get('content')}"
-                                    
+                                    expanded_clauses = []  # 확장에 사용된 하위 조항 번호 추적
+
+                                    # 1차: 조항 번호 기반 하위 확장 (예: "1" → "1.1", "1.2" 등)
+                                    for c in all_chunks:
+                                        child_clause = str(c.get('clause', ''))
+                                        child_content = c.get('content', '')
+                                        if not child_clause or not child_content:
+                                            continue
+                                        # 현재 조항의 직접 하위 조항만 포함
+                                        if child_clause.startswith(f"{current_section}.") and child_clause != current_section:
+                                            content_hash = hashlib.md5(child_content.encode()).hexdigest()
+                                            if content_hash not in seen_content:
+                                                extra_content += f"\n[하위 조항 {child_clause}] {child_content}"
+                                                expanded_clauses.append(child_clause)
+                                                if len(extra_content) > 3000:
+                                                    break
+
+                                    # 2차: 조항 기반 확장 실패 시 위치 기반 폴백
+                                    if not extra_content:
+                                        current_idx = -1
+                                        for idx, c in enumerate(all_chunks):
+                                            if c.get("content") == r["content"]:
+                                                current_idx = idx
+                                                break
+                                        if current_idx != -1:
+                                            for i in range(1, 4):
+                                                if current_idx + i < len(all_chunks):
+                                                    next_c = all_chunks[current_idx + i]
+                                                    next_clause = str(next_c.get('clause', ''))
+                                                    extra_content += f"\n[하위 조항 {next_clause}] {next_c.get('content')}"
+                                                    if next_clause:
+                                                        expanded_clauses.append(next_clause)
+
                                     if extra_content:
                                         r["content"] += extra_content
-                                        print(f"    [Hierarchical Expansion] {r['section']} 하위 내용 확장 완료")
+                                        # section 필드에 확장된 하위 조항 번호도 포함
+                                        if expanded_clauses:
+                                            r["section"] = f"{current_section}, {', '.join(expanded_clauses)}"
+                                        print(f"    [Hierarchical Expansion] {current_section} → {', '.join(expanded_clauses)} 확장 완료 (doc_id: {numeric_doc_id})")
                         except Exception as ex:
                             print(f" Expansion error: {ex}")
 
@@ -702,9 +735,14 @@ def retrieval_agent_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 tool_content,
                 re.MULTILINE | re.DOTALL
             )
-            for doc_name, clause, body in hits[:5]:
+            for doc_name, clause, body in hits[:10]:
                 body = re.sub(r'\s+', ' ', (body or '').strip())
                 if not body:
+                    continue
+                # 제목만 반복되는 헤더성 청크는 제외 (실질 내용이 50자 미만이면 스킵)
+                # 예: "목적 Purpose 목적 Purpose" 같은 내용 필터링
+                clean_body = re.sub(r'\[상세\]\s*', '', body).strip()
+                if len(clean_body) < 50:
                     continue
                 recovered_sources.append((doc_name.strip(), clause.strip(), body[:300]))
 
