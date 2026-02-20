@@ -87,7 +87,7 @@ export default function DocumentViewer({
 
     const initEditor = () => {
       if (editorInstanceRef.current) {
-        try { editorInstanceRef.current.destroyEditor() } catch (_) {}
+        try { editorInstanceRef.current.destroyEditor() } catch (_) { }
         editorInstanceRef.current = null
       }
       const container = document.getElementById(editorContainerId)
@@ -306,7 +306,7 @@ export default function DocumentViewer({
         /품질경영실/i.test(trimmedLine)
       )
 
-      if (isHeader) {
+      if (isHeader && !sectionMatch) {
         if (!firstHeaderBlockPassed) { inHeaderBlock = true }
         else { return }
       } else if (inHeaderBlock) {
@@ -386,13 +386,13 @@ export default function DocumentViewer({
             onBlur={
               editable
                 ? (e) => {
-                    const text = (e.currentTarget as HTMLDivElement).innerText
-                    const normalized = text
-                      .replace(/\u00A0/g, ' ')
-                      .replace(/\n{3,}/g, '\n\n')
-                      .trim()
-                    setEditedContent(normalized)
-                  }
+                  const text = (e.currentTarget as HTMLDivElement).innerText
+                  const normalized = text
+                    .replace(/\u00A0/g, ' ')
+                    .replace(/\n{3,}/g, '\n\n')
+                    .trim()
+                  setEditedContent(normalized)
+                }
                 : undefined
             }
           >
