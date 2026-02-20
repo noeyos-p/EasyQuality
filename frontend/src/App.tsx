@@ -146,7 +146,7 @@ function App() {
     checkBackendStatus()
   }, [])
 
-  const handleDocumentSelect = useCallback(async (docId: string, docType?: string, clause?: string) => {
+  const handleDocumentSelect = useCallback(async (docId: string, docType?: string, version?: string, clause?: string) => {
     setSelectedDocument(docId)
     setSelectedClause(clause || null)
     setIsEditing(false)
@@ -157,7 +157,10 @@ function App() {
     // PDF → 텍스트 content 불러와서 기존 renderDocument()로 표시
     if (docType?.toLowerCase() === 'pdf') {
       try {
-        const response = await fetch(`${API_URL}/rag/document/${docId}/content`)
+        const url = version
+          ? `${API_URL}/rag/document/${docId}/content?version=${version}`
+          : `${API_URL}/rag/document/${docId}/content`
+        const response = await fetch(url)
         if (response.ok) {
           const data = await response.json()
           setDocumentContent(data.content || '')
@@ -173,7 +176,10 @@ function App() {
     if (docType?.toLowerCase() !== 'docx') {
       // docx가 아닌 기타 파일 → 텍스트 컨텐트로 표시
       try {
-        const response = await fetch(`${API_URL}/rag/document/${docId}/content`)
+        const url = version
+          ? `${API_URL}/rag/document/${docId}/content?version=${version}`
+          : `${API_URL}/rag/document/${docId}/content`
+        const response = await fetch(url)
         if (response.ok) {
           const data = await response.json()
           setDocumentContent(data.content || '')
@@ -194,12 +200,16 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           doc_name: docId,
+          version: version, // 버전을 파라미터로 전달
           user_name: user?.username || 'Anonymous',
           mode: 'view',
         }),
       })
 
       if (response.ok) {
+        const data = await response.json()
+        setOnlyOfficeConfig(data.config)
+        setOnlyOfficeServerUrl(data.onlyoffice_server_url)
         setIsOnlyOfficeMode(true)
         setOnlyOfficeEditorMode('view')
       } else {

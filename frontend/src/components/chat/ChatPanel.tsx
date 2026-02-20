@@ -6,7 +6,7 @@ import { API_URL } from '../../types'
 
 interface ChatPanelProps {
   isVisible: boolean
-  onDocumentSelect: (docId: string, docType?: string, clause?: string) => void
+  onDocumentSelect: (docId: string, docType?: string, version?: string, clause?: string) => void
 }
 
 const ChatPanel = memo(function ChatPanel({ isVisible, onDocumentSelect }: ChatPanelProps) {

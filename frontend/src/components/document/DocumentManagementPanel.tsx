@@ -35,7 +35,7 @@ interface Version {
 }
 
 interface DocumentManagementPanelProps {
-  onDocumentSelect?: (docId: string, docType?: string) => void;
+  onDocumentSelect?: (docId: string, docType?: string, version?: string, clause?: string) => void;
   onNotify?: (message: string, type?: 'success' | 'error' | 'info') => void;
   onOpenInEditor?: (docId: string, version?: string) => void;
   refreshCounter?: number;
@@ -198,7 +198,7 @@ export default function DocumentManagementPanel({ onDocumentSelect, onNotify, on
   const handleViewDocument = async (docName: string, version?: string, docType?: string) => {
     // 항상 onDocumentSelect 호출 (content 조회 실패해도 뷰어는 열림)
     if (onDocumentSelect) {
-      onDocumentSelect(docName, docType);
+      onDocumentSelect(docName, docType, version);
     }
     try {
       const url = version
