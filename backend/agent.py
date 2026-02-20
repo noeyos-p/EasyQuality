@@ -422,6 +422,13 @@ You direct sub-agents to resolve user questions and verify reported results.
         print(f" [Guardrail] 관계 질문 감지 -> 'graph' 강제 라우팅 ('{last_user_msg}')")
         return {"next_agent": "graph", "loop_count": loop_count + 1, "agent_calls": agent_calls}
 
+    # [Guardrail] 비교 질문 감지 (라우팅 탈주 방지)
+    compare_keywords = ["비교", "달라짐", "차이", "변경내역", "변경 내용", "버전", "v1", "v2", "계약", "문서 비교"]
+    is_compare_query = any(k in last_user_msg for k in compare_keywords)
+    if is_compare_query and "comparison" not in agent_calls and loop_count == 0:
+        print(f" [Guardrail] 비교 질문 감지 -> 'comparison' 강제 라우팅 ('{last_user_msg}')")
+        return {"next_agent": "comparison", "loop_count": loop_count + 1, "agent_calls": agent_calls}
+
     try:
         response = client.chat.completions.create(
             model="gpt-4o",
