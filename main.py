@@ -1064,12 +1064,17 @@ async def process_chat_request(request: ChatRequest) -> Dict:
 
             query_embedding = None
             try:
-                embed_model = SentenceTransformer("intfloat/multilingual-e5-small")
-                query_embedding = embed_model.encode(request.message).tolist()
+                # 무거운 모델 로드는 스레드에서 실행
+                def _get_embedding():
+                    embed_model = SentenceTransformer("intfloat/multilingual-e5-small")
+                    return embed_model.encode(request.message).tolist()
+                
+                query_embedding = await asyncio.to_thread(_get_embedding)
             except Exception as embed_error:
                 print(f"  ⚠️ [Memory] 임베딩 생성 실패: {embed_error}")
 
-            sql_store.save_memory(
+            await asyncio.to_thread(
+                sql_store.save_memory,
                 request.message,
                 answer,
                 user_id,
@@ -1090,17 +1095,20 @@ async def process_chat_request(request: ChatRequest) -> Dict:
     try:
         from backend.evaluation import AgentEvaluator
         if len(answer) >= 20 and not is_error_message:
-            evaluator = AgentEvaluator(judge_model="gpt-4o", sql_store=sql_store)
-            context = response.get("agent_log", {}).get("context", "")
-            if isinstance(context, list):
-                context = "\n\n".join(context)
+            # 평가기(AgentEvaluator)는 내부적으로 동기 통신을 수행하므로 별도 스레드에서 실행
+            def _evaluate():
+                evaluator = AgentEvaluator(judge_model="gpt-4o", sql_store=sql_store)
+                context = response.get("agent_log", {}).get("context", "")
+                if isinstance(context, list):
+                    context = "\n\n".join(context)
 
-            evaluation_scores = evaluator.evaluate_single(
-                question=request.message,
-                answer=answer,
-                context=context,
-                metrics=["faithfulness", "groundness", "relevancy", "correctness"]
-            )
+                return evaluator.evaluate_single(
+                    question=request.message,
+                    answer=answer,
+                    context=context,
+                    metrics=["faithfulness", "groundness", "relevancy", "correctness"]
+                )
+            evaluation_scores = await asyncio.to_thread(_evaluate)
     except ImportError:
         print("평가 모듈 사용 불가 (선택적 기능)")
     except Exception as eval_error:
@@ -1617,7 +1625,7 @@ async def download_document(
     """문서를 다양한 파일 형식으로 다운로드"""
     try:
         # DB에서 문서 조회 (버전 명시 없으면 최신본)
-        doc = sql_store.get_document_by_name(doc_name, version)
+        doc = await asyncio.to_thread(sql_store.get_document_by_name, doc_name, version)
         if not doc:
             raise HTTPException(404, "문서를 찾을 수 없습니다.")
             
@@ -1640,7 +1648,7 @@ async def download_document(
         # 2. 워드(.docx) 형식 요청
         if format == "docx":
             filename = f"{safe_filename}_v{ver}.docx"
-            docx_bytes = md_to_docx_binary(content, doc_name)
+            docx_bytes = await asyncio.to_thread(md_to_docx_binary, content, doc_name)
             return Response(
                 content=docx_bytes,
                 media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -1659,7 +1667,7 @@ async def download_document(
             )
             
         # 3-2. 텍스트(마크다운)인 경우 PDF로 변환
-        pdf_bytes = md_to_pdf_binary(content)
+        pdf_bytes = await asyncio.to_thread(md_to_pdf_binary, content)
         return Response(
             content=pdf_bytes,
             media_type="application/pdf",
@@ -1931,13 +1939,15 @@ async def graph_upload_document(
         raise HTTPException(500, f"그래프 업로드 실패: {str(e)}")
 
 
-@app.get("/graph/documents")
-def graph_list_documents():
-    """Neo4j 문서 목록"""
+@app.get("/rag/documents")
+async def list_documents(
+    user_id: Optional[str] = None,
+    doc_type: Optional[str] = None
+):
+    """업로드된 문서 목록 조회"""
     try:
-        graph = get_graph_store()
-        docs = graph.get_all_documents()
-        return {"documents": docs, "count": len(docs)}
+        docs = await asyncio.to_thread(sql_store.get_all_documents, user_id, doc_type)
+        return docs
     except Exception as e:
         raise HTTPException(500, f"문서 목록 조회 실패: {str(e)}")
 
