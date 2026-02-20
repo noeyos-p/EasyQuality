@@ -1,5 +1,6 @@
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import rehypeRaw from 'rehype-raw'
 import MermaidRenderer from '../graph/MermaidRenderer'
 import type { ChatMessage as ChatMessageType } from '../../types'
 import { SCORE_COLORS } from '../../types'
@@ -122,6 +123,7 @@ export default function ChatMessage({ msg, index, expandedSections, toggleSectio
         <div className="flex-1 text-[13px] text-txt-primary">
           <ReactMarkdown
             remarkPlugins={[remarkGfm]}
+            rehypePlugins={[rehypeRaw]}
             components={markdownTextComponents}
           >
             {msg.content}
@@ -175,6 +177,7 @@ export default function ChatMessage({ msg, index, expandedSections, toggleSectio
       <div className="response-body">
         <ReactMarkdown
           remarkPlugins={[remarkGfm]}
+          rehypePlugins={[rehypeRaw]}
           components={{
             ...markdownTextComponents,
             code({ node, inline, className, children, ...props }: any) {
