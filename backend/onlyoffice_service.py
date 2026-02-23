@@ -25,28 +25,22 @@ def create_editor_config(
     user_name: str,
     file_url: str,
     mode: str = "view",
+    file_type: str = "docx",
 ) -> Dict[str, Any]:
     """
     OnlyOffice DocsAPI에 전달할 설정 JSON 생성
-
-    Args:
-        doc_id    : 문서 ID (예: EQ-SOP-00001)
-        version   : 문서 버전 (예: 1.0)
-        user_name : 편집자 이름
-        file_url  : S3 presigned URL (OnlyOffice가 DOCX를 가져올 URL)
-
-    Returns:
-        OnlyOffice DocsAPI 설정 dict (JWT token 포함)
     """
-    # 편집 모드일 때만 콜백 URL 설정
-    is_edit_mode = (mode == "edit")
+    # 편집 모드일 때만 콜백 URL 설정 (PDF는 편집 불가)
+    is_edit_mode = (mode == "edit") and (file_type == "docx")
+
+    # PDF일 경우 documentType 변경
+    doc_type = "pdf" if file_type == "pdf" else "word"
 
     config = {
         "document": {
-            "fileType": "docx",
-            # 캐시 무효화용 고유 키: 저장 시마다 새 키 필요
+            "fileType": file_type,
             "key": f"{doc_id}_v{version}_{int(time.time())}",
-            "title": f"{doc_id}_v{version}.docx",
+            "title": f"{doc_id}_v{version}.{file_type}",
             "url": file_url,
             "permissions": {
                 "comment": is_edit_mode,
@@ -57,7 +51,7 @@ def create_editor_config(
                 "review": is_edit_mode,
             },
         },
-        "documentType": "word",
+        "documentType": doc_type,
         "editorConfig": {
             "user": {
                 "id": user_name.replace(" ", "_"),

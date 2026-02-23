@@ -467,7 +467,6 @@ The key characteristics are as follows.
     model_to_use = state["model"]
     print(f"[DEBUG call_model_node] Using model: {model_to_use}")
 
-    # LangChain ChatOpenAI 사용 (tools 바인딩) - LangSmith 자동 추적
     from backend.agent import get_langchain_llm
     llm = get_langchain_llm(model=model_to_use, temperature=0.0)
     llm_with_tools = llm.bind(tools=tools, tool_choice="auto")
@@ -541,23 +540,33 @@ def tool_executor_node(state: SearchState):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def create_deep_search_graph():
-    """자율적 도구 호출을 수행하는CompiledSubAgent 스타일 그래프"""
+    """자율적 도구 호출을 수행하는CompiledSubAgent 스타일 그래프
+    - 검색은 1회만 수행, 재시도 결정은 외부 오케스트레이터가 담당
+    """
     workflow = StateGraph(SearchState)
-    
+
     workflow.add_node("agent", call_model_node)
     workflow.add_node("action", tool_executor_node)
-    
+
     workflow.add_edge(START, "agent")
-    
+
     def router(state: SearchState):
         last_msg = state["messages"][-1]
+        # 이미 tool 결과가 1개 이상이면 → 답변 작성으로 강제 종료
+        tool_count = sum(
+            1 for m in state["messages"]
+            if (isinstance(m, dict) and m.get("role") == "tool") or
+               (hasattr(m, "role") and m.role == "tool")
+        )
+        if tool_count >= 1:
+            return END
         if last_msg.tool_calls:
             return "action"
         return END
-    
+
     workflow.add_conditional_edges("agent", router, {"action": "action", END: END})
     workflow.add_edge("action", "agent")
-    
+
     return workflow.compile(name="Deep Search Agent Flow")
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -673,8 +682,7 @@ def retrieval_agent_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
     print(f" [Deep Search] 정밀 검색 가동: {state['query']}")
 
-    # v8.5: 질문 텍스트에서 SOP ID 자동 감지 (정규식 사용)
-    # 예: "EQ-SOP-00001 목적이 뭐야?" -> target_doc_id="EQ-SOP-00001"
+    # 질문 텍스트에서 SOP ID 자동 감지
     auto_doc_id = None
     sop_pattern = r'(EQ-(?:SOP|WI|FRM)-\d+)'
     match = re.search(sop_pattern, state['query'], re.IGNORECASE)
@@ -686,81 +694,63 @@ def retrieval_agent_node(state: Dict[str, Any]) -> Dict[str, Any]:
     worker_model = state.get("worker_model")
     model_name = state.get("model_name")
     final_model = worker_model or model_name or "gpt-4o"
-    print(f"[DEBUG retrieval] model={final_model}")
+
+    # 오케스트레이터 Critic 피드백이 있으면 재시도 지시사항으로 추가
+    critique_feedback = state.get("critique_feedback")
+    initial_messages = [{"role": "user", "content": state["query"]}]
+    if critique_feedback:
+        print(f"    [Deep Search] Critic 피드백 반영: {critique_feedback}")
+        initial_messages.append({
+            "role": "user",
+            "content": (
+                f"[Orchestrator Critic Feedback] 이전 검색이 불충분했습니다. "
+                f"다른 방식으로 재시도하세요:\n{critique_feedback}"
+            ),
+        })
 
     initial_state = {
-        "messages": [{"role": "user", "content": state["query"]}],
+        "messages": initial_messages,
         "query": state["query"],
         "model": final_model,
-        "final_answer": ""
+        "final_answer": "",
     }
 
-    # 만약 오케스트레이터가 넘겨준 타겟이 없고 본문에서 감지되었다면 주입
-    # (이미 있으면 그대로 유지)
     if auto_doc_id and not state.get("target_doc_id"):
-        # 초기 메시지에 힌트를 주어 LLM이 tool 호출 시 해당 ID를 사용하도록 유도하거나, 
-        # 직접 SearchState에 반영 (여기서는 search_documents_internal 호출 시 반영되도록 model_node 프롬프트 보강 고려 가능)
-        # 하지만 더 확실한 방법은 call_model_node의 프롬프트에 감지된 ID를 명시하는 것임
         initial_state["detected_doc_id"] = auto_doc_id
 
-    # 내부 도구 호출 루프 실행 (재귀 한도 내에서 자율 검색)
-    result = _deep_search_app.invoke(initial_state, config={"recursion_limit": 15})
+    # 내부 도구 호출 (검색 1회 후 종료)
+    result = _deep_search_app.invoke(initial_state, config={"recursion_limit": 10})
 
-    # 마지막 메시지가 LLM의 최종 답변
-    final_msg = result["messages"][-1].content
+    # 마지막 메시지에서 실제 답변 추출
+    # (router가 tool_calls 있는 상태에서 END 시킬 수 있으므로 content 있는 마지막 AI 메시지 탐색)
+    final_msg = ""
+    for msg in reversed(result["messages"]):
+        content = getattr(msg, "content", None) or (msg.get("content") if isinstance(msg, dict) else None)
+        tool_calls = getattr(msg, "tool_calls", None) or (msg.get("tool_calls") if isinstance(msg, dict) else None)
+        if content and not tool_calls:
+            final_msg = content
+            break
+
+    # 답변이 없으면 (LLM이 tool_calls 만 했을 경우) tool_choice=none 으로 강제 답변 생성
+    if not final_msg:
+        from backend.agent import get_langchain_llm
+        llm = get_langchain_llm(model=final_model, temperature=0.0)
+        from langchain_core.tools import tool as lc_tool
+        tools_def = [{"type": "function", "function": {"name": "search_documents_tool", "description": "Search", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}}]
+        llm_forced = llm.bind(tools=tools_def, tool_choice="none")
+        forced_res = llm_forced.invoke(
+            [{"role": "system", "content": "Write the final answer based on the search results above."}]
+            + list(result["messages"])
+        )
+        final_msg = getattr(forced_res, "content", "") or "검색 결과를 찾을 수 없습니다."
 
     # 참고문헌 섹션 자동 추가
     final_msg_with_refs = _ensure_reference_section(result["messages"], final_msg)
 
-    # 복구 로직:
-    # LLM이 NO_INFO를 반환했더라도, tool 결과에 [DATA_SOURCE]가 있으면
-    # 검색된 근거를 바탕으로 최소 답변을 생성해 파이프라인 단절을 방지
-    has_no_info = (
-        "No relevant information found within the searched documents." in final_msg_with_refs
-        or "[NO_INFO_FOUND]" in final_msg_with_refs
-        or "검색된 정보가 없습니다" in final_msg_with_refs
-    )
-    if has_no_info:
-        recovered_sources = []
-        for msg in result["messages"]:
-            if isinstance(msg, dict) and msg.get("role") == "tool":
-                tool_content = msg.get("content", "")
-            elif hasattr(msg, "role") and msg.role == "tool":
-                tool_content = getattr(msg, "content", "")
-            else:
-                continue
-
-            hits = re.findall(
-                r'\[DATA_SOURCE\]\s*문서 정보:\s*([^\n]+)\s*해당 조항:\s*([^\n]+)\s*본문 내용:\s*(.*?)\s*\[END_SOURCE\]',
-                tool_content,
-                re.MULTILINE | re.DOTALL
-            )
-            for doc_name, clause, body in hits[:10]:
-                body = re.sub(r'\s+', ' ', (body or '').strip())
-                if not body:
-                    continue
-                # 제목만 반복되는 헤더성 청크는 제외 (실질 내용이 50자 미만이면 스킵)
-                # 예: "목적 Purpose 목적 Purpose" 같은 내용 필터링
-                clean_body = re.sub(r'\[하위 조항 [^\]]*\]\s*', '', body)
-                clean_body = re.sub(r'\[상세\]\s*', '', clean_body).strip()
-                if len(clean_body) < 50:
-                    continue
-                # 답변에 포함될 body에서 하위 조항 태그 제거
-                clean_body_for_answer = re.sub(r'\[하위 조항 [^\]]*\]\s*', '', body)
-                clean_body_for_answer = re.sub(r'\[상세\]\s*', '', clean_body_for_answer).strip()
-                recovered_sources.append((doc_name.strip(), clause.strip(), clean_body_for_answer[:300]))
-
-        if recovered_sources:
-            lines = []
-            for doc_name, clause, body in recovered_sources[:3]:
-                lines.append(f"{doc_name}의 {clause}에 따르면 {body}[USE: {doc_name} | {clause}]")
-            lines.append("[DONE]")
-            final_msg_with_refs = "\n".join(lines)
-            print(f"🟡 [Deep Search] NO_INFO 복구 적용: {len(recovered_sources)}건 소스 기반 최소 답변 생성")
-
-    # [중요] 답변 에이전트 도입을 위해 직접 답변하지 않고 context에 보고서 형태로 저장 (리스트 형태로 반환하여 누적)
+    # [중요] 오케스트레이터가 결과를 비판(Critic)할 수 있도록 context에 보고서로 저장
+    # has_no_info 복구 블록은 제거됨 - 오케스트레이터 Critic이 불충분 결과를 잡아 재시도 지시
     report = f"### [검색 에이전트 조사 최종 보고]\n{final_msg_with_refs}"
-    return {"context": [report]}
+    return {"context": [report], "last_agent": "retrieval"}
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 레거시 도구 호환용 (필요 시)

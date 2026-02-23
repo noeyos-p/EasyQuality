@@ -30,10 +30,15 @@ def comparison_agent_node(state: AgentState):
     query = state["query"]
     model = state.get("worker_model") or state.get("model_name") or "gpt-4o"
 
-    # 1. 의도 분석 (LangChain ChatOpenAI 사용 - LangSmith 자동 추적)
-    # 사용자가 버전 목록을 보고 싶어하는지, 아니면 실제 내용 비교를 원하는지 구분
+    # Critic 피드백 주입
+    critique_feedback = state.get("critique_feedback")
+    critique_hint = f"\n\n[Orchestrator Critic Feedback] {critique_feedback}" if critique_feedback else ""
+    if critique_feedback:
+        print(f"    [Comparison] Critic 피드백 반영: {critique_feedback}")
+
+    # 1. 의도 분석
     intent_prompt = f"""Extract the intent and parameters from the user question.
-Question: {query}
+Question: {query}{critique_hint}
 
 ## Intent Classification
 
@@ -74,7 +79,7 @@ Question: {query}
             # [USE: ...] 태그 추가 (참고문서에 포함되도록)
             use_tag = f"[USE: {doc_id} | 버전 이력]"
 
-            return {"context": [f"### [{doc_id} 버전 이력]\n{history}\n\n{use_tag} [DONE]"]}
+            return {"context": [f"### [{doc_id} 버전 이력]\n{history}\n\n{use_tag} [DONE]"], "last_agent": "comparison"}
 
         # [CASE 2] 버전 비교
         elif intent == "compare_versions":
@@ -98,9 +103,9 @@ Question: {query}
                     v1, v2 = unique_versions[1], unique_versions[0] # v1(이전), v2(최신)
                     print(f"     -> 자동 선택된 버전: {v1} vs {v2}")
                 elif len(unique_versions) == 1:
-                    return {"context": [f"### [{doc_id} 비교 불가]\n현재 문서의 버전이 하나({unique_versions[0]})뿐이라 비교할 대상이 없습니다. [DONE]"]}
+                    return {"context": [f"### [{doc_id} 비교 불가]\n현재 문서의 버전이 하나({unique_versions[0]})뿐이라 비교할 대상이 없습니다. [DONE]"], "last_agent": "comparison"}
                 else:
-                    return {"context": [f"### [{doc_id} 비교 불가]\n버전 목록을 가져올 수 없어 비교가 불가능합니다."]}
+                    return {"context": [f"### [{doc_id} 비교 불가]\n버전 목록을 가져올 수 없어 비교가 불가능합니다."], "last_agent": "comparison"}
 
             # 실제 비교 데이터 조회 (SQL Diff) 및 검증
             print(f"[DEBUG] SQL Diff 조회 시작: {doc_id}, v1={v1}, v2={v2}")
@@ -174,8 +179,8 @@ Question: {query}
                     except:
                         pass
 
-            if not diffs: 
-                 return {"context": [f"### [비교 에이전트 오류]\n{doc_id}의 지정된 버전({v1}, {v2}) 데이터를 가져올 수 없습니다. [DONE]"]}
+            if not diffs:
+                 return {"context": [f"### [비교 에이전트 오류]\n{doc_id}의 지정된 버전({v1}, {v2}) 데이터를 가져올 수 없습니다. [DONE]"], "last_agent": "comparison"}
 
             # 3. 종합 분석 (Z.AI)
             analysis_prompt = f"""당신은 GMP 규정 전문 분석가입니다. 아래의 변경 데이터(Diff)와 영향 분석 데이터(Impact)를 바탕으로 전문적이고 사실 중심적인 '문서 변경 비교 보고서'를 작성하세요.
@@ -272,13 +277,13 @@ Question: {query}
                 use_tags_str = " ".join(use_tags)
                 print(f"[DEBUG compare.py] 생성된 USE 태그: {use_tags_str[:200]}...")
 
-                return {"context": [final_report + f"\n\n{use_tags_str} [DONE]"]}
+                return {"context": [final_report + f"\n\n{use_tags_str} [DONE]"], "last_agent": "comparison"}
             except Exception as e:
-                return {"context": [f"### [비교 보고서 생성 실패]\nLLM 호출 중 오류가 발생했습니다: {e} [DONE]"]}
+                return {"context": [f"### [비교 보고서 생성 실패]\nLLM 호출 중 오류가 발생했습니다: {e} [DONE]"], "last_agent": "comparison"}
 
         else:
-             return {"context": [f"### [이해 불가]\n죄송합니다, 의도를 파악하지 못했습니다. (Intent: {intent}) [DONE]"]}
-    
+             return {"context": [f"### [이해 불가]\n죄송합니다, 의도를 파악하지 못했습니다. (Intent: {intent}) [DONE]"], "last_agent": "comparison"}
+
     except Exception as e:
         print(f"Compare Agent Error: {e}")
-        return {"context": [f"### [에이전트 처리 오류]\n{str(e)} [DONE]"]}
+        return {"context": [f"### [에이전트 처리 오류]\n{str(e)} [DONE]"], "last_agent": "comparison"}
