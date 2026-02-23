@@ -1,6 +1,6 @@
 """
-문서 검색 서브에이전트 모듈 (Deep Agent 스타일)
-- 질문 분석 후 다단계 정밀 검색을 수행하는 그래프 구조의 에이전트
+문서 검색 서브에이전트 모듈
+- 검색 → LLM 답변 단일 흐름 (내부 루프 없음)
 - 벡터 검색 (Weaviate), SQL 검색 (PostgreSQL) 통합
 """
 
@@ -8,13 +8,10 @@ import os
 import re
 import json
 import hashlib
-import operator
-from typing import List, Dict, Any, Optional, Literal, Annotated, TypedDict
+from typing import List, Dict, Any, Optional, Literal
 from backend.agent import get_openai_client, AgentState, search_sop_tool, get_sop_headers_tool, safe_json_loads, normalize_doc_id
 from langsmith import traceable
 from langchain_core.tools import tool
-from langsmith import traceable
-from langgraph.graph import StateGraph, START, END
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 전역 스토어 및 클라이언트 관리
@@ -355,219 +352,6 @@ def search_documents_internal(
     print(f"    [검색 완료] 전체 {len(results)}건 중 유효 결과 {len(valid_results)}건 반환")
     return valid_results
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 딥 검색 에이전트 상태 정의 (CompiledSubAgent 호환)
-# ═══════════════════════════════════════════════════════════════════════════
-
-class SearchState(TypedDict):
-    """
-    가이드에 따른 에이전트 상태.
-    'messages' 키를 포함하여 툴 호출과 응답 이력을 관리합니다.
-    """
-    messages: Annotated[List[Any], operator.add]
-    query: str
-    model: str
-    final_answer: str
-    detected_doc_id: Optional[str] # v8.5 추가
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 노드 및 도구 설정
-# ═══════════════════════════════════════════════════════════════════════════
-
-@traceable(name="search_agent_llm_call", run_type="llm")
-def call_model_node(state: SearchState):
-    """LLM이 질문을 분석하고 도구 호출 여부를 결정함 (자율 계획)"""
-    client = get_openai_client()
-    messages = state["messages"]
-    
-    system_prompt = f"""You are a specialized agent for GMP/SOP document retrieval.
-Use the search tool to accurately answer user questions.
-{f"**Priority search target**: {state.get('detected_doc_id')}" if state.get('detected_doc_id') else ""}
-
-## Principles
-
-- **No information without a source**: Never write content that is not in [DATA_SOURCE].
-- **Specify document name**: Always use the document ID (e.g., EQ-SOP-00001) as the subject instead of pronouns like "this document" or "this regulation."
-- **On search failure**: Return "No relevant information found within the searched documents." + [NO_INFO_FOUND].
-
-## Search Method (search_documents_tool)
-
-- `query`: Pass the user question **as-is in its original form**. Do not convert it into a query format.
-  - O "What is a work instruction?" -> query: "What is a work instruction?"
-  - X query: "work instruction definition"
-- `target_clause`: Specify if a particular clause number is mentioned (e.g., "5.4.2").
-- `keywords`: Extract only **nouns that actually appear** in the question. Do not infer or add additional terms.
-  - O "What is a work instruction?" -> ["work instruction"]
-  - X ["work instruction", "definition", "purpose"]
-
-## Answer Writing Rules
-
-**Format**: Korean plain text. No markdown (**, #, -, *). Use [ ] or line breaks for emphasis.
-
-**Source tagging ([USE: ...] tags)**:
-- Every sentence sourced from [DATA_SOURCE] must end with a `[USE: document name | clause]` tag.
-- The clause number must be an **exact copy** of the "applicable clause" field from the corresponding [DATA_SOURCE].
-- Information from different [DATA_SOURCE] entries must use their respective clause numbers.
-- Answers without tags will be treated as verification failures.
-- The [Reference Documents] section is auto-generated from tags; do not write it manually.
-
-**Example**:
-A work instruction is a guidance document for consistently operating on-site tasks.[USE: EQ-SOP-00001 | 5.1.3 Level 3 (Work Instruction (WI):]
-The key characteristics are as follows.
-1. It defines the operational flow and management methods at the department or process level.[USE: EQ-SOP-00001 | 5.1.3 Level 3 (Work Instruction (WI):]
-2. It includes cleaning and disinfection methods, testing methods, etc.[USE: EQ-SOP-00001 | 5.4.2 Work Instruction Writing]
-[DONE]
-
-## Pre-submission Checklist
-
-- Does every sentence have a [USE: ...] tag?
-- Does each tag's clause number match the "applicable clause" of the corresponding [DATA_SOURCE]?
-- Was the document ID used instead of pronouns like "this document"?
-- Was the [Reference Documents] section not written manually?
-- Is [DONE] appended at the end of the answer?"""
-    
-    # 시스템 프롬프트를 메시지 맨 앞에 삽입
-    full_messages = [{"role": "system", "content": system_prompt}] + messages
-    
-    # Tool definition
-    tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": "search_documents_tool",
-                "description": "Search GMP/SOP documents. The agent designs search conditions autonomously.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "User's original question as-is (e.g., '작업지침서가 뭐야'). DO NOT transform or rewrite."
-                        },
-                        "keywords": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Key nouns that actually appear in the question (e.g., ['작업지침서']). DO NOT include inferred words."
-                        },
-                        "target_clause": {
-                            "type": "string",
-                            "description": "Specific clause number to target (e.g., '5.1.3', '5.4.2'). Use only when explicitly mentioned."
-                        },
-                        "target_doc_id": {
-                            "type": "string",
-                            "description": "Limit search scope to a specific document (e.g., 'EQ-SOP-00001')"
-                        }
-                    },
-                    "required": ["query"]
-                }
-            }
-        }
-    ]
-    
-    # 디버깅: 모델 확인
-    model_to_use = state["model"]
-    print(f"[DEBUG call_model_node] Using model: {model_to_use}")
-
-    from backend.agent import get_langchain_llm
-    llm = get_langchain_llm(model=model_to_use, temperature=0.0)
-    llm_with_tools = llm.bind(tools=tools, tool_choice="auto")
-
-    res = llm_with_tools.invoke(full_messages)
-
-    return {"messages": [res]}
-
-def tool_executor_node(state: SearchState):
-    """LLM이 요청한 도구를 실행하고 결과를 메시지에 추가함"""
-    last_msg = state["messages"][-1]
-    tool_calls = last_msg.tool_calls
-    
-    tool_outputs = []
-    for tc in tool_calls:
-        # LangChain과 OpenAI API 호환성 처리
-        if isinstance(tc, dict):
-            # LangChain 형식 (dict)
-            tool_name = tc.get("name")
-            tool_args = tc.get("args", {})
-            tool_id = tc.get("id")
-        else:
-            # OpenAI API 형식 (객체)
-            tool_name = tc.function.name
-            tool_args = safe_json_loads(tc.function.arguments)
-            tool_id = tc.id
-
-        if tool_name == "search_documents_tool":
-            query = tool_args.get("query")
-            keywords = tool_args.get("keywords", [])
-            target_clause = tool_args.get("target_clause")
-
-            # v8.4: 문서 ID 정규화 (eEQ- -> EQ-)
-            target_doc_id = normalize_doc_id(tool_args.get("target_doc_id"))
-            # LLM이 target_doc_id를 누락해도, 질문에서 감지된 ID가 있으면 강제 주입
-            if not target_doc_id and state.get("detected_doc_id"):
-                target_doc_id = normalize_doc_id(state.get("detected_doc_id"))
-                print(f"    [Deep Search] 감지된 문서 ID 강제 적용: {target_doc_id}")
-
-            print(f"    [Deep Search] 도구 호출: '{query}' (키워드: {keywords}, 타겟조항: {target_clause}, 타겟문서: {target_doc_id or '전체'})")
-
-            results = search_documents_internal(query=query, keywords=keywords, target_clause=target_clause, target_doc_id=target_doc_id)
-            print(f"    [Deep Search] 검색 결과 {len(results)}건 발견")
-
-            formatted_results = []
-            for r in results:
-                doc_name = r.get('doc_name', '알 수 없는 문서')
-                section = r.get('section', '조항 미상')
-                content = r.get('content', '')
-                formatted_results.append(
-                    f"[DATA_SOURCE]\n"
-                    f"문서 정보: {doc_name}\n"
-                    f"해당 조항: {section}\n"
-                    f"본문 내용: {content}\n"
-                    f"[END_SOURCE]"
-                )
-
-            content = "\n\n".join(formatted_results)
-            if not content: content = "검색 결과가 없습니다."
-
-            tool_outputs.append({
-                "role": "tool",
-                "tool_call_id": tool_id,
-                "content": content
-            })
-            
-    return {"messages": tool_outputs}
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 그래프 구성
-# ═══════════════════════════════════════════════════════════════════════════
-
-def create_deep_search_graph():
-    """자율적 도구 호출을 수행하는CompiledSubAgent 스타일 그래프
-    - 검색은 1회만 수행, 재시도 결정은 외부 오케스트레이터가 담당
-    """
-    workflow = StateGraph(SearchState)
-
-    workflow.add_node("agent", call_model_node)
-    workflow.add_node("action", tool_executor_node)
-
-    workflow.add_edge(START, "agent")
-
-    def router(state: SearchState):
-        last_msg = state["messages"][-1]
-        # 이미 tool 결과가 1개 이상이면 → 답변 작성으로 강제 종료
-        tool_count = sum(
-            1 for m in state["messages"]
-            if (isinstance(m, dict) and m.get("role") == "tool") or
-               (hasattr(m, "role") and m.role == "tool")
-        )
-        if tool_count >= 1:
-            return END
-        if last_msg.tool_calls:
-            return "action"
-        return END
-
-    workflow.add_conditional_edges("agent", router, {"action": "action", END: END})
-    workflow.add_edge("action", "agent")
-
-    return workflow.compile(name="Deep Search Agent Flow")
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 참고문서 섹션 자동 생성
@@ -671,84 +455,89 @@ def _ensure_reference_section(messages: List[Any], final_answer: str) -> str:
 # 메인 엔트리 포인트
 # ═══════════════════════════════════════════════════════════════════════════
 
-_deep_search_app = None
+_SEARCH_SYSTEM = """You are a GMP/SOP document search specialist. You ONLY answer based on the [DATA_SOURCE] blocks provided. You have NO other knowledge. You cannot use your training data.
+
+## Strict Rules
+
+RULE 1 - SOURCES ONLY: Every sentence in your answer MUST come from a [DATA_SOURCE] block. If you cannot find the answer in the provided [DATA_SOURCE] blocks, you MUST say:
+"검색된 문서 내에서 관련 정보를 찾을 수 없습니다.[NO_INFO_FOUND]"
+Do NOT answer from general knowledge. Do NOT invent or infer information.
+
+RULE 2 - TAG EVERY SOURCE: For every [DATA_SOURCE] block you use, end the sentence with [USE: document_name | clause].
+- "document_name" = exact value from "문서 정보" field
+- "clause" = exact value from "해당 조항" field (copy exactly, do not shorten)
+
+RULE 3 - NO MERGING: Each [DATA_SOURCE] must be tagged separately. Do not merge multiple sources into one sentence.
+
+RULE 4 - ALL RELEVANT SOURCES: If multiple [DATA_SOURCE] blocks are relevant, all of them must appear in your answer with their own [USE] tag. Do not pick just one.
+
+RULE 5 - FORMAT: Korean plain text only. No markdown (no **, #, -, *). End with [DONE].
+
+## Example
+질문: 작업지침서가 뭐야?
+→ 작업지침서는 현장 업무를 일관되게 운영하기 위한 문서입니다.[USE: EQ-SOP-00001 | 5.1.3]
+부서 수준의 운영 흐름과 관리 방법을 정의합니다.[USE: EQ-SOP-00001 | 5.2.1]
+세척 및 소독 방법, 시험 방법이 포함됩니다.[USE: EQ-SOP-00002 | 3.4]
+[DONE]
+
+## Example (no relevant results)
+질문: 규격서가 뭐야?
+→ 검색된 문서 내에서 관련 정보를 찾을 수 없습니다.[NO_INFO_FOUND]
+[DONE]"""
 
 @traceable(name="sub_agent:search")
 def retrieval_agent_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """[서브] 검색 에이전트 (CompiledSubAgent 스타일)"""
-    global _deep_search_app
-    if not _deep_search_app:
-        _deep_search_app = create_deep_search_graph()
+    """[서브] 검색 에이전트 - 검색 1회 후 LLM 답변 생성"""
+    query = state["query"]
+    print(f"[Search] 검색 시작: {query}")
 
-    print(f" [Deep Search] 정밀 검색 가동: {state['query']}")
-
-    # 질문 텍스트에서 SOP ID 자동 감지
+    # 문서 ID 감지
     auto_doc_id = None
-    sop_pattern = r'(EQ-(?:SOP|WI|FRM)-\d+)'
-    match = re.search(sop_pattern, state['query'], re.IGNORECASE)
+    match = re.search(r'(EQ-(?:SOP|WI|FRM)-\d+)', query, re.IGNORECASE)
     if match:
-        auto_doc_id = match.group(1).upper()
-        print(f"    [Deep Search] 질문에서 문서 ID 감지: {auto_doc_id}")
+        auto_doc_id = normalize_doc_id(match.group(1))
+        print(f"[Search] 문서 ID 감지: {auto_doc_id}")
 
-    # 모델 정보 확인
-    worker_model = state.get("worker_model")
-    model_name = state.get("model_name")
-    final_model = worker_model or model_name or "gpt-4o"
-
-    # 오케스트레이터 Critic 피드백이 있으면 재시도 지시사항으로 추가
+    # Critic 피드백이 있으면 쿼리에 추가
     critique_feedback = state.get("critique_feedback")
-    initial_messages = [{"role": "user", "content": state["query"]}]
+    search_query = query
     if critique_feedback:
-        print(f"    [Deep Search] Critic 피드백 반영: {critique_feedback}")
-        initial_messages.append({
-            "role": "user",
-            "content": (
-                f"[Orchestrator Critic Feedback] 이전 검색이 불충분했습니다. "
-                f"다른 방식으로 재시도하세요:\n{critique_feedback}"
-            ),
-        })
+        search_query = f"{query} {critique_feedback}"
+        print(f"[Search] Critic 피드백 반영: {critique_feedback}")
 
-    initial_state = {
-        "messages": initial_messages,
-        "query": state["query"],
-        "model": final_model,
-        "final_answer": "",
-    }
+    # 검색 실행
+    final_model = state.get("worker_model") or state.get("model_name") or "gpt-4o"
+    results = search_documents_internal(
+        query=search_query,
+        target_doc_id=auto_doc_id,
+    )
+    print(f"[Search] 검색 결과 {len(results)}건")
 
-    if auto_doc_id and not state.get("target_doc_id"):
-        initial_state["detected_doc_id"] = auto_doc_id
-
-    # 내부 도구 호출 (검색 1회 후 종료)
-    result = _deep_search_app.invoke(initial_state, config={"recursion_limit": 10})
-
-    # 마지막 메시지에서 실제 답변 추출
-    # (router가 tool_calls 있는 상태에서 END 시킬 수 있으므로 content 있는 마지막 AI 메시지 탐색)
-    final_msg = ""
-    for msg in reversed(result["messages"]):
-        content = getattr(msg, "content", None) or (msg.get("content") if isinstance(msg, dict) else None)
-        tool_calls = getattr(msg, "tool_calls", None) or (msg.get("tool_calls") if isinstance(msg, dict) else None)
-        if content and not tool_calls:
-            final_msg = content
-            break
-
-    # 답변이 없으면 (LLM이 tool_calls 만 했을 경우) tool_choice=none 으로 강제 답변 생성
-    if not final_msg:
-        from backend.agent import get_langchain_llm
-        llm = get_langchain_llm(model=final_model, temperature=0.0)
-        from langchain_core.tools import tool as lc_tool
-        tools_def = [{"type": "function", "function": {"name": "search_documents_tool", "description": "Search", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}}]
-        llm_forced = llm.bind(tools=tools_def, tool_choice="none")
-        forced_res = llm_forced.invoke(
-            [{"role": "system", "content": "Write the final answer based on the search results above."}]
-            + list(result["messages"])
+    # 결과 포매팅 (상위 20개, 내용 1000자 제한)
+    formatted = []
+    for r in results[:20]:
+        formatted.append(
+            f"[DATA_SOURCE]\n"
+            f"문서 정보: {r.get('doc_name', 'Unknown')}\n"
+            f"해당 조항: {r.get('section', '본문')}\n"
+            f"본문 내용: {r.get('content', '')[:1000]}\n"
+            f"[END_SOURCE]"
         )
-        final_msg = getattr(forced_res, "content", "") or "검색 결과를 찾을 수 없습니다."
+    data_str = "\n\n".join(formatted) if formatted else "검색 결과 없음."
 
-    # 참고문헌 섹션 자동 추가
-    final_msg_with_refs = _ensure_reference_section(result["messages"], final_msg)
+    # LLM 답변 생성 (1회)
+    from backend.agent import get_langchain_llm
+    llm = get_langchain_llm(model=final_model, temperature=0.0)
+    messages = [
+        {"role": "system", "content": _SEARCH_SYSTEM},
+        {"role": "user", "content": f"질문: {query}\n\n{data_str}"},
+    ]
+    res = llm.invoke(messages)
+    final_msg = getattr(res, "content", "").strip() or "검색 결과를 찾을 수 없습니다."
 
-    # [중요] 오케스트레이터가 결과를 비판(Critic)할 수 있도록 context에 보고서로 저장
-    # has_no_info 복구 블록은 제거됨 - 오케스트레이터 Critic이 불충분 결과를 잡아 재시도 지시
+    # 참고문헌 섹션 자동 추가 (tool 메시지 없으므로 빈 리스트 전달)
+    final_msg_with_refs = _ensure_reference_section([], final_msg)
+
     report = f"### [검색 에이전트 조사 최종 보고]\n{final_msg_with_refs}"
     return {"context": [report], "last_agent": "retrieval"}
 

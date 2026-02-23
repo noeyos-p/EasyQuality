@@ -396,7 +396,11 @@ def search(
             meta = json.loads(obj.properties.get('metadata_json', '{}'))
         except:
             meta = obj.properties
-            
+
+        top_doc_id = obj.properties.get('doc_id', '')
+        if top_doc_id and not meta.get('doc_id'):
+            meta['doc_id'] = top_doc_id
+
         search_results.append({
             "text": obj.properties.get('text', ""),
             "similarity": round(similarity, 4),
@@ -412,6 +416,9 @@ def search(
             similarity = obj.metadata.certainty or 0.0
             try: meta = json.loads(obj.properties.get('metadata_json', '{}'))
             except: meta = obj.properties
+            top_doc_id = obj.properties.get('doc_id', '')
+            if top_doc_id and not meta.get('doc_id'):
+                meta['doc_id'] = top_doc_id
             search_results.append({
                 "text": obj.properties.get('text', ""),
                 "similarity": round(similarity, 4),
@@ -459,12 +466,17 @@ def search_hybrid(
         search_results = []
         for obj in res.objects:
             score = obj.metadata.score if obj.metadata.score is not None else 0.0
-            
+
             try:
                 meta = json.loads(obj.properties.get('metadata_json', '{}'))
             except:
                 meta = obj.properties
-                
+
+            # top-level doc_id 프로퍼티를 metadata에 병합 (metadata_json에 없는 경우 대비)
+            top_doc_id = obj.properties.get('doc_id', '')
+            if top_doc_id and not meta.get('doc_id'):
+                meta['doc_id'] = top_doc_id
+
             search_results.append({
                 "text": obj.properties.get('text', ""),
                 "similarity": round(score, 4),
