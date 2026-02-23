@@ -10,9 +10,12 @@ def chat_agent_node(state: AgentState):
     """[서브] 대화 에이전트 - 히스토리 기반 답변 생성"""
     query = state["query"]
     messages = state["messages"]
-    
-    # 시스템 프롬프트: 히스토리 기반 답변 유도
-    # 시스템 프롬프트: 히스토리 기반 답변 유도
+
+    # Critic 피드백 주입
+    critique_feedback = state.get("critique_feedback")
+    if critique_feedback:
+        print(f"    [Chat] Critic 피드백 반영: {critique_feedback}")
+
     system_instruction = """You are the conversation agent of the GMP regulatory system.
 Answer user questions based on conversation history (History) and [related past memories].
 
@@ -41,12 +44,11 @@ Answer user questions based on conversation history (History) and [related past 
             temperature=0.7
         )
         answer = response.choices[0].message.content
-        
-        # 보고서 형식으로 반환 (오케스트레이터가 재검토하도록)
+
         report = f"### [대화 에이전트 보고]\n{answer}"
-        return {"context": [report]}
-        
+        return {"context": [report], "last_agent": "chat"}
+
     except Exception as e:
         error_msg = f"대화 처리 중 오류가 발생했습니다: {str(e)} [DONE]"
-        return {"context": [error_msg]}
+        return {"context": [error_msg], "last_agent": "chat"}
         
