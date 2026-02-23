@@ -12,38 +12,52 @@ from langsmith import traceable
 # 시각화 지원: 관계를 한눈에 볼 수 있도록 Mermaid 다이어그램을 생성합니다.
 # 전문 보고서 형식: 참조 관계의 의미와 변경 시 주의사항을 포함한 상세 보고서를 제공합니다.
 # 이제 에이전트에게 "SOP-xxx 변경 시 영향 알려줘"와 같이 질문하면 더욱 풍부한 답변을 받을 수 있습니다.
-def generate_mermaid_flow(doc_id: str, refs: dict, impact_data: list = None) -> str:
-    """Mermaid 다이어그램 코드 생성 (참조 및 영향 분석 통합)"""
+def generate_mermaid_flow(doc_id: str, refs: dict, impact_data: list = None,
+                          ref_sections: dict = None, cited_sections: dict = None) -> str:
+    """Mermaid 다이어그램 코드 생성 (참조 및 영향 분석 통합)
+    ref_sections: {ref_doc_id: [section, ...]}
+    cited_sections: {cited_doc_id: [section, ...]}
+    """
     lines = ["graph LR"]
-    safe_doc_id = doc_id.replace("-", "_")
-    
+
     doc = refs.get("document") or {}
     title = (doc.get("title") or doc_id).replace('"', "'")
-    
-    # 메인 노드 스타일
     lines.append(f'    Main["{doc_id}<br/>({title})"]:::mainNode')
-    
-    # 1. 문서 간 참조 (References/Cited By)
+
+    ref_sections = ref_sections or {}
+    cited_sections = cited_sections or {}
+
+    # 1. 참조하는 문서 (Main → ref)
     for ref in refs.get("references", []):
-        # ref가 dict인 경우 doc_id 추출
         ref_doc = ref.get("doc_id") if isinstance(ref, dict) else ref
         if ref_doc:
             ref_id = ref_doc.replace("-", "_")
-            lines.append(f'    Main --> {ref_id}["{ref_doc}"]')
+            sections = ref_sections.get(ref_doc, [])
+            label = ", ".join(sections) if sections else ""
+            if label:
+                lines.append(f'    Main -- "{label}" --> {ref_id}["{ref_doc}"]')
+            else:
+                lines.append(f'    Main --> {ref_id}["{ref_doc}"]')
 
+    # 2. 참조받는 문서 (cited → Main)
     for cited in refs.get("cited_by", []):
-        # cited가 dict인 경우 doc_id 추출
         cited_doc = cited.get("doc_id") if isinstance(cited, dict) else cited
         if cited_doc:
             cited_id = cited_doc.replace("-", "_")
-            lines.append(f'    {cited_id}["{cited_doc}"] --> Main')
+            sections = cited_sections.get(cited_doc, [])
+            label = ", ".join(sections) if sections else ""
+            if label:
+                lines.append(f'    {cited_id}["{cited_doc}"] -- "{label}" --> Main')
+            else:
+                lines.append(f'    {cited_id}["{cited_doc}"] --> Main')
 
-    # 2. 영향 분석 데이터가 있는 경우 추가 (정밀 관계)
+    # 3. 영향 분석 데이터
     if impact_data:
-        for idx, imp in enumerate(impact_data):
+        for imp in impact_data:
             src_id = imp.get("source_doc_id", "Unknown").replace("-", "_")
             section = imp.get("citing_section", "")
-            lines.append(f'    Main -- "{section} 조항에서 언급" --> {src_id}')
+            label = f"{section} 조항" if section else "영향"
+            lines.append(f'    Main -- "{label}" --> {src_id}["{imp.get("source_doc_id", "Unknown")}"]')
 
     lines.append("    classDef mainNode fill:#f96,stroke:#333,stroke-width:4px,color:#000;")
     lines.append("    classDef default fill:#eee,stroke:#333,color:#000;")
@@ -55,10 +69,16 @@ def graph_agent_node(state: AgentState):
     query = state["query"]
     model = state.get("worker_model") or state.get("model_name") or "gpt-4o"
 
-    # 1. 의도 및 엔티티 추출 (LangChain ChatOpenAI 사용 - LangSmith 자동 추적)
+    # Critic 피드백 주입
+    critique_feedback = state.get("critique_feedback")
+    critique_hint = f"\n\n[Orchestrator Critic Feedback] {critique_feedback}" if critique_feedback else ""
+    if critique_feedback:
+        print(f"    [Graph] Critic 피드백 반영: {critique_feedback}")
+
+    # 1. 의도 및 엔티티 추출
     messages = state.get("messages", [])
     extraction_prompt = f"""Extract the target SOP ID and intent from the user question and conversation history.
-Question: {query}
+Question: {query}{critique_hint}
 
 ## Intent Classification
 
@@ -95,7 +115,7 @@ Question: {query}
         intent = "general_info"
     
     if not doc_id:
-        return {"messages": [{"role": "assistant", "content": "[그래프 에이전트] 분석할 문서 ID를 찾지 못했습니다. 요청에 문서 번호를 포함해 주세요."}]}
+        return {"context": ["[그래프 에이전트] 분석할 문서 ID를 찾지 못했습니다. 요청에 문서 번호를 포함해 주세요."], "last_agent": "graph"}
 
     # 2. 데이터 조회
     refs_str = get_references_tool.invoke({"doc_id": doc_id})
@@ -132,10 +152,67 @@ Question: {query}
         impact_list = []
         # 실패해도 계속 진행 (조항 정보 없이)
 
-    # 3. 시각화 (Mermaid) 생성
-    mermaid_code = generate_mermaid_flow(doc_id, ref_data, impact_list)
-    
-    # 4. 심층 분석 (LangChain ChatOpenAI 사용)
+    # 3. 조항 정보 수집 (Mermaid 및 USE 태그용)
+    ref_sections = {}    # {ref_doc: [section, ...]}
+    cited_sections = {}  # {cited_doc: [section, ...]}
+    use_tags = [f"[USE: {doc_id} | 문서 관계]"]
+
+    for ref_item in ref_data.get("references", []):
+        ref_doc = ref_item.get("doc_id") if isinstance(ref_item, dict) else ref_item
+        if not ref_doc:
+            continue
+        try:
+            if graph_store and graph_store.driver:
+                with graph_store.driver.session(database=graph_store.database) as session:
+                    result = session.run("""
+                        MATCH (source:Document {doc_id: $source_id})-[:HAS_SECTION]->(section:Section)-[:MENTIONS]->(target:Document {doc_id: $target_id})
+                        RETURN section.section_id as section_id LIMIT 5
+                    """, source_id=doc_id, target_id=ref_doc)
+                    sections = [r["section_id"].split(":")[-1] if ":" in r["section_id"] else r["section_id"] for r in result]
+                    ref_sections[ref_doc] = sections
+                    for s in sections:
+                        use_tags.append(f"[USE: {doc_id} | {s}]")
+                    if not sections:
+                        use_tags.append(f"[USE: {ref_doc} | 상위 참조]")
+            else:
+                use_tags.append(f"[USE: {ref_doc} | 상위 참조]")
+        except Exception as e:
+            print(f"[DEBUG graph.py] ref 조항 조회 실패: {e}")
+            use_tags.append(f"[USE: {ref_doc} | 상위 참조]")
+
+    for cited_item in ref_data.get("cited_by", []):
+        cited_doc = cited_item.get("doc_id") if isinstance(cited_item, dict) else cited_item
+        if not cited_doc:
+            continue
+        try:
+            if graph_store and graph_store.driver:
+                with graph_store.driver.session(database=graph_store.database) as session:
+                    result = session.run("""
+                        MATCH (source:Document {doc_id: $source_id})-[:HAS_SECTION]->(section:Section)-[:MENTIONS]->(target:Document {doc_id: $target_id})
+                        RETURN section.section_id as section_id LIMIT 5
+                    """, source_id=cited_doc, target_id=doc_id)
+                    sections = [r["section_id"].split(":")[-1] if ":" in r["section_id"] else r["section_id"] for r in result]
+                    cited_sections[cited_doc] = sections
+                    for s in sections:
+                        use_tags.append(f"[USE: {cited_doc} | {s}]")
+                    if not sections:
+                        use_tags.append(f"[USE: {cited_doc} | 하위 참조]")
+            else:
+                use_tags.append(f"[USE: {cited_doc} | 하위 참조]")
+        except Exception as e:
+            print(f"[DEBUG graph.py] cited 조항 조회 실패: {e}")
+            use_tags.append(f"[USE: {cited_doc} | 하위 참조]")
+
+    for imp in impact_list:
+        src_doc = imp.get("source_doc_id")
+        section = imp.get("citing_section", "")
+        if src_doc:
+            use_tags.append(f"[USE: {src_doc} | {section}]" if section else f"[USE: {src_doc} | 영향 조항]")
+
+    # 4. 시각화 (Mermaid) 생성 - 조항 정보 포함
+    mermaid_code = generate_mermaid_flow(doc_id, ref_data, impact_list, ref_sections, cited_sections)
+
+    # 5. 심층 분석 (LangChain ChatOpenAI 사용)
     analysis_prompt = f"""다음 그래프 데이터를 바탕으로 질문에 대해 간단명료한 분석 보고서를 작성하세요.
     질문: {query}
     의도: {intent}
@@ -168,86 +245,7 @@ Question: {query}
     # Mermaid 다이어그램 추가 및 결과 조합
     llm_analysis = analysis_res.content.strip()
 
-    # [USE: ...] 태그 생성 (참고문서에 포함되도록)
-    use_tags = []
-
-    # 메인 문서
-    use_tags.append(f"[USE: {doc_id} | 문서 관계]")
-
-    # 참조하는 문서들 (상위 문서) - 조항 정보 포함
-    for ref_item in ref_data.get("references", []):
-        # ref_item이 dict인 경우 doc_id 추출
-        ref_doc = ref_item.get("doc_id") if isinstance(ref_item, dict) else ref_item
-        if ref_doc:
-            # 어느 조항에서 참조하는지 Neo4j에서 조회
-            try:
-                if graph_store and graph_store.driver:
-                    with graph_store.driver.session(database=graph_store.database) as session:
-                        result = session.run("""
-                            MATCH (source:Document {doc_id: $source_id})-[:HAS_SECTION]->(section:Section)-[:MENTIONS]->(target:Document {doc_id: $target_id})
-                            RETURN section.section_id as section_id
-                            LIMIT 5
-                        """, source_id=doc_id, target_id=ref_doc)
-
-                        sections = [record["section_id"].split(":")[-1] if ":" in record["section_id"] else record["section_id"]
-                                   for record in result]
-
-                        if sections:
-                            for section in sections:
-                                use_tags.append(f"[USE: {doc_id} | {section}]")
-                                print(f"[DEBUG graph.py] 상위 참조 태그 추가: {doc_id} > {section} (참조대상: {ref_doc})")
-                        else:
-                            use_tags.append(f"[USE: {ref_doc} | 상위 참조]")
-                            print(f"[DEBUG graph.py] 상위 참조 태그 추가 (조항 정보 없음): {ref_doc}")
-                else:
-                    use_tags.append(f"[USE: {ref_doc} | 상위 참조]")
-            except Exception as e:
-                print(f"[DEBUG graph.py] 조항 정보 조회 실패: {e}")
-                use_tags.append(f"[USE: {ref_doc} | 상위 참조]")
-
-    # 참조받는 문서들 (하위 문서) - 조항 정보 포함
-    for cited_item in ref_data.get("cited_by", []):
-        # cited_item이 dict인 경우 doc_id 추출
-        cited_doc = cited_item.get("doc_id") if isinstance(cited_item, dict) else cited_item
-        if cited_doc:
-            # 어느 조항에서 참조하는지 Neo4j에서 조회
-            try:
-                if graph_store and graph_store.driver:
-                    with graph_store.driver.session(database=graph_store.database) as session:
-                        result = session.run("""
-                            MATCH (source:Document {doc_id: $source_id})-[:HAS_SECTION]->(section:Section)-[:MENTIONS]->(target:Document {doc_id: $target_id})
-                            RETURN section.section_id as section_id
-                            LIMIT 5
-                        """, source_id=cited_doc, target_id=doc_id)
-
-                        sections = [record["section_id"].split(":")[-1] if ":" in record["section_id"] else record["section_id"]
-                                   for record in result]
-
-                        if sections:
-                            for section in sections:
-                                use_tags.append(f"[USE: {cited_doc} | {section}]")
-                                print(f"[DEBUG graph.py] 하위 참조 태그 추가: {cited_doc} > {section}")
-                        else:
-                            use_tags.append(f"[USE: {cited_doc} | 하위 참조]")
-                            print(f"[DEBUG graph.py] 하위 참조 태그 추가 (조항 정보 없음): {cited_doc}")
-                else:
-                    use_tags.append(f"[USE: {cited_doc} | 하위 참조]")
-            except Exception as e:
-                print(f"[DEBUG graph.py] 조항 정보 조회 실패: {e}")
-                use_tags.append(f"[USE: {cited_doc} | 하위 참조]")
-
-    # 영향 분석 데이터 (조항 정보 포함)
-    if impact_list:
-        print(f"[DEBUG graph.py] impact_list 개수: {len(impact_list)}")
-        for imp in impact_list:
-            src_doc = imp.get("source_doc_id")
-            section = imp.get("citing_section", "")
-            print(f"[DEBUG graph.py] 영향 문서: {src_doc}, 조항: {section}")
-            if src_doc:
-                if section:
-                    use_tags.append(f"[USE: {src_doc} | {section}]")
-                else:
-                    use_tags.append(f"[USE: {src_doc} | 영향 조항]")
+    # USE 태그는 위 조항 수집 단계에서 이미 생성됨
 
     # USE 태그를 보고서에 추가 (hidden)
     use_tags_str = " ".join(use_tags)
@@ -270,4 +268,4 @@ Question: {query}
         except:
             pass
 
-    return {"context": [final_report]}
+    return {"context": [final_report], "last_agent": "graph"}

@@ -8,6 +8,14 @@ import re
 from collections import defaultdict
 from backend.agent import AgentState
 
+try:
+    from langsmith import traceable as _traceable
+except ImportError:
+    def _traceable(**kwargs):
+        def decorator(fn): return fn
+        return decorator
+
+@_traceable(name="answer_agent", run_type="chain")
 def answer_agent_node(state: AgentState):
     """[서브] 답변 에이전트 - [USE: ...] 태그를 제거하고 [참고 문서] 섹션만 생성"""
 
@@ -16,7 +24,15 @@ def answer_agent_node(state: AgentState):
     if not context_list:
         return {"messages": [{"role": "assistant", "content": "검색된 정보가 없습니다."}]}
 
-    # context에서 검색 에이전트의 보고서 추출
+    # Critic 재시도로 인해 동일한 보고서가 중복 누적된 경우 마지막 것만 유지
+    # (앞 200자를 키로 사용해 중복 감지)
+    deduped = {}
+    for i, c in enumerate(context_list):
+        key = c[:200].strip()
+        deduped[key] = i  # 같은 내용이면 가장 나중 인덱스 유지
+    kept_indices = sorted(deduped.values())
+    context_list = [context_list[i] for i in kept_indices]
+
     search_report = "\n\n".join(context_list)
 
     # "[검색 에이전트 조사 최종 보고]" 헤더 제거

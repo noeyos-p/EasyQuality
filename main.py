@@ -865,13 +865,17 @@ def process_upload_task(
                 version=final_version
             )
 
-            # 원본 PDF를 S3에 저장
-            if filename.lower().endswith('.pdf'):
-                try:
-                    get_s3_store().upload_pdf(doc_id, final_version, content)
+            # 원본 파일을 S3에 저장
+            try:
+                s3 = get_s3_store()
+                if filename.lower().endswith('.pdf'):
+                    s3.upload_pdf(doc_id, final_version, content)
                     print(f"  🟢 원본 PDF S3 저장 완료: {doc_id}/v{final_version}", flush=True)
-                except Exception as e:
-                    print(f"  🟡 S3 PDF 저장 실패 (무시): {e}", flush=True)
+                elif filename.lower().endswith('.docx'):
+                    s3.upload_docx(doc_id, final_version, content)
+                    print(f"  🟢 원본 DOCX S3 저장 완료: {doc_id}/v{final_version}", flush=True)
+            except Exception as e:
+                print(f"  🟡 S3 저장 실패 (무시): {e}", flush=True)
 
             if doc_id_db and chunks:
                 batch_chunks = [
@@ -1087,41 +1091,51 @@ async def process_chat_request(request: ChatRequest) -> Dict:
             import traceback
             traceback.print_exc()
 
-    # LLM as a Judge 평가
-    evaluation_scores = None
-    error_patterns = ["오류가 발생", "에러", "실패", "Error", "Exception", "찾을 수 없", "준비하지 못", "로딩 에러"]
-    is_error_message = any(pattern in answer for pattern in error_patterns)
-
-    try:
-        from backend.evaluation import AgentEvaluator
-        if len(answer) >= 20 and not is_error_message:
-            # 평가기(AgentEvaluator)는 내부적으로 동기 통신을 수행하므로 별도 스레드에서 실행
-            def _evaluate():
-                evaluator = AgentEvaluator(judge_model="gpt-4o", sql_store=sql_store)
-                context = response.get("agent_log", {}).get("context", "")
-                if isinstance(context, list):
-                    context = "\n\n".join(context)
-
-                return evaluator.evaluate_single(
-                    question=request.message,
-                    answer=answer,
-                    context=context,
-                    metrics=["faithfulness", "groundness", "relevancy", "correctness"]
-                )
-            evaluation_scores = await asyncio.to_thread(_evaluate)
-    except ImportError:
-        print("평가 모듈 사용 불가 (선택적 기능)")
-    except Exception as eval_error:
-        print(f"평가 실행 실패 (계속 진행): {eval_error}")
-        evaluation_scores = None
-
     return {
         "session_id": session_id,
         "answer": answer,
         "sources": [],
         "agent_log": response,
-        "evaluation_scores": evaluation_scores
+        "evaluation_scores": None  # 평가는 답변 완료 후 백그라운드에서 실행
     }
+
+
+async def _run_evaluation_background(request_id: str, result_data: dict):
+    """답변 완료 후 백그라운드에서 LLM-as-a-Judge 평가를 실행하고 결과를 업데이트."""
+    answer = result_data.get("answer", "")
+    error_patterns = ["오류가 발생", "에러", "실패", "Error", "Exception", "찾을 수 없", "준비하지 못", "로딩 에러"]
+    if len(answer) < 20 or any(p in answer for p in error_patterns):
+        return
+
+    try:
+        from backend.evaluation import AgentEvaluator
+
+        def _evaluate():
+            evaluator = AgentEvaluator(judge_model="gpt-4o", sql_store=sql_store)
+            context = result_data.get("agent_log", {}).get("agent_log", {}).get("context", "")
+            if isinstance(context, list):
+                context = "\n\n".join(context)
+            question = result_data.get("agent_log", {}).get("agent_log", {}).get("query", "")
+            return evaluator.evaluate_single(
+                question=question,
+                answer=answer,
+                context=context,
+                metrics=["faithfulness", "groundness", "relevancy", "correctness"]
+            )
+
+        evaluation_scores = await asyncio.to_thread(_evaluate)
+        print(f" 📊 [Eval] {request_id} 평가 완료")
+
+        # 결과 업데이트
+        load_queue_state()
+        if request_id in chat_results and chat_results[request_id].get("result"):
+            chat_results[request_id]["result"]["evaluation_scores"] = evaluation_scores
+        save_queue_state()
+
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f" ⚠️ [Eval] {request_id} 평가 실패: {e}")
 
 
 async def chat_worker():
@@ -1179,8 +1193,12 @@ async def chat_worker():
                     "result": result_data
                 })
             save_queue_state()
-            
+
             print(f" ✅ [Chat Worker] 처리 완료: {request_id}")
+
+            # ── LLM-as-a-Judge 평가 (백그라운드 실행 - 답변과 무관하게 비동기) ──
+            if kind == "rag":
+                asyncio.create_task(_run_evaluation_background(request_id, result_data))
         except Exception as e:
             print(f" 🔴 [Chat Worker] 에러: {e}")
             import traceback
@@ -2871,7 +2889,18 @@ async def onlyoffice_config(request: OnlyOfficeConfigRequest):
 
         # 백엔드 내부 URL 사용 (S3 presigned URL 대신)
         # OnlyOffice가 JWT 헤더를 붙여 요청 → 백엔드가 검증 후 S3에서 파일 서빙
-        file_url = f"{BACKEND_URL}/onlyoffice/document/{doc_name}/{version}"
+        from urllib.parse import quote
+        encoded_doc_name = quote(doc_name, safe='')
+        file_url = f"{BACKEND_URL}/onlyoffice/document/{encoded_doc_name}/{version}"
+
+        # S3에서 실제 파일 타입 확인 (DOCX 우선, PDF fallback)
+        s3 = get_s3_store()
+        if s3.object_exists(doc_name, version):
+            file_type = "docx"
+        elif s3.pdf_exists(doc_name, version):
+            file_type = "pdf"
+        else:
+            raise HTTPException(404, f"S3에 문서 파일이 없습니다: {doc_name} v{version}")
 
         # OnlyOffice 설정 생성
         config = create_editor_config(
@@ -2879,7 +2908,8 @@ async def onlyoffice_config(request: OnlyOfficeConfigRequest):
             version=version,
             user_name=request.user_name,
             file_url=file_url,
-            mode=request.mode,
+            mode=request.mode if file_type == "docx" else "view",
+            file_type=file_type,
         )
 
         return {
@@ -2900,14 +2930,18 @@ async def onlyoffice_config(request: OnlyOfficeConfigRequest):
 @app.get("/onlyoffice/document/{doc_name}/{version}")
 async def serve_docx_for_onlyoffice(doc_name: str, version: str):
     """
-    OnlyOffice Document Server가 DOCX를 가져가는 내부 엔드포인트.
-    S3 presigned URL 대신 이 URL을 document.url로 사용:
-      - OnlyOffice가 JWT Authorization 헤더를 붙여도 S3와 충돌 없음
-      - 백엔드가 S3에서 파일을 가져와 OnlyOffice에 직접 서빙
+    OnlyOffice Document Server가 문서를 가져가는 내부 엔드포인트.
+    DOCX 우선, 없으면 PDF fallback.
     """
     try:
         s3 = get_s3_store()
-        content = s3.download_docx(doc_name, version)
+        content, file_type = s3.download_document(doc_name, version)
+        if file_type == 'pdf':
+            return Response(
+                content=content,
+                media_type="application/pdf",
+                headers={"Content-Disposition": f'attachment; filename="{doc_name}_v{version}.pdf"'},
+            )
         return Response(
             content=content,
             media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",

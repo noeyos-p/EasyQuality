@@ -1,6 +1,61 @@
 import React from 'react'
 import { API_URL } from '../../types'
 
+/** A4 페이지를 컨테이너 너비에 맞게 스케일하는 래퍼 */
+function ScaledDocPage({
+  scale,
+  docWidth,
+  htmlRef,
+  children,
+}: {
+  scale: number
+  docWidth: number
+  htmlRef: React.RefObject<HTMLDivElement | null>
+  children: React.ReactNode
+}) {
+  const innerRef = React.useRef<HTMLDivElement | null>(null)
+  const [scaledHeight, setScaledHeight] = React.useState<number | undefined>(undefined)
+
+  // 실제 렌더된 높이 * scale = 실제 차지할 높이
+  React.useEffect(() => {
+    const el = innerRef.current
+    if (!el) return
+    const observer = new ResizeObserver(() => {
+      setScaledHeight(el.scrollHeight * scale)
+    })
+    observer.observe(el)
+    return () => observer.disconnect()
+  }, [scale])
+
+  return (
+    <div
+      style={{
+        width: `${docWidth * scale}px`,
+        height: scaledHeight !== undefined ? `${scaledHeight}px` : undefined,
+        overflow: 'hidden',
+        flexShrink: 0,
+      }}
+    >
+      <div
+        ref={(node) => {
+          innerRef.current = node
+          if (typeof htmlRef === 'object' && htmlRef !== null) {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            ;(htmlRef as any).current = node
+          }
+        }}
+        style={{
+          transformOrigin: 'top left',
+          transform: `scale(${scale})`,
+          width: `${docWidth}px`,
+        }}
+      >
+        {children}
+      </div>
+    </div>
+  )
+}
+
 interface DocumentViewerProps {
   selectedDocument: string
   targetClause?: string | null
@@ -29,10 +84,26 @@ export default function DocumentViewer({
   onClose,
 }: DocumentViewerProps) {
   const [isDownloadOpen, setIsDownloadOpen] = React.useState(false)
+  const [docScale, setDocScale] = React.useState(1)
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const editorInstanceRef = React.useRef<any>(null)
   const htmlRenderRef = React.useRef<HTMLDivElement | null>(null)
   const editablePageRef = React.useRef<HTMLDivElement | null>(null)
+  const scrollContainerRef = React.useRef<HTMLDivElement | null>(null)
+
+  const DOC_WIDTH = 794
+  const DOC_PADDING = 40 // 좌우 여백
+
+  React.useEffect(() => {
+    const container = scrollContainerRef.current
+    if (!container) return
+    const observer = new ResizeObserver(([entry]) => {
+      const available = entry.contentRect.width - DOC_PADDING * 2
+      setDocScale(available < DOC_WIDTH ? available / DOC_WIDTH : 1)
+    })
+    observer.observe(container)
+    return () => observer.disconnect()
+  }, [])
 
   void onlyOfficeEditorMode
 
@@ -448,7 +519,7 @@ export default function DocumentViewer({
           <div id="onlyoffice-editor" className="w-full h-full" />
         </div>
       ) : (
-        <div className="flex-1 overflow-y-auto p-0 bg-[#c8c8c8] flex flex-col items-center gap-[30px]">
+        <div ref={scrollContainerRef} className="flex-1 overflow-y-auto p-0 bg-[#c8c8c8] flex flex-col items-center gap-[30px]">
           {isEditing ? (
             <div className="w-full flex flex-col items-center gap-3 py-4">
               <div className="text-[12px] text-txt-secondary">
@@ -457,9 +528,9 @@ export default function DocumentViewer({
               {renderDocument(editedContent || documentContent, true)}
             </div>
           ) : (
-            <div ref={htmlRenderRef}>
+            <ScaledDocPage scale={docScale} docWidth={DOC_WIDTH} htmlRef={htmlRenderRef}>
               {renderDocument(documentContent, false)}
-            </div>
+            </ScaledDocPage>
           )}
         </div>
       )}
