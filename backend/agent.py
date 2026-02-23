@@ -528,7 +528,7 @@ Follow the execution plan already established for this query.
         }
 
     # [Guardrail] 비교 질문
-    compare_keywords = ["비교", "달라짐", "차이", "변경내역", "변경 내용", "버전", "v1", "v2", "계약", "문서 비교"]
+    compare_keywords = ["비교", "달라짐", "차이", "변경내역", "변경 내용", "변경이력", "개정", "버전", "v1", "v2", "계약", "문서 비교"]
     if any(k in last_user_msg for k in compare_keywords) and "comparison" not in agent_calls and loop_count == 0:
         print(f"[Guardrail] 비교 질문 감지 → 'comparison' 강제 라우팅")
         return {
@@ -741,6 +741,12 @@ def _get_deep_agent_tools() -> list:
 
 _DEEP_ORCHESTRATOR_SYSTEM = """You are a Deep Agent orchestrator for a GMP regulatory document system.
 
+## CRITICAL: You MUST call a tool before writing any answer.
+
+You CANNOT answer questions directly from your own knowledge. You MUST always call one of the tools first.
+Only after receiving tool results may you write the final answer.
+If you write an answer without calling a tool first, it is a critical error.
+
 ## Tool Selection Examples
 
 Use `graph` for questions like:
@@ -752,6 +758,7 @@ Use `graph` for questions like:
 - "문서 간 관계를 보여줘"
 
 Use `retrieval` for questions like:
+- "규격서가 뭐야?"
 - "SOP-001의 5.1 조항 내용은?"
 - "장비 세척 절차가 뭐야?"
 - "GMP에서 일탈은 어떻게 정의해?"
@@ -760,17 +767,21 @@ Use `retrieval` for questions like:
 Use `comparison` for questions like:
 - "SOP-001 버전 1과 버전 2의 차이는?"
 - "이전 버전에서 뭐가 바뀌었어?"
+- "문서의 변경이력 알려줘"
+- "변경이력이 뭐야?"
+- "이 문서 어떻게 바뀌었어?"
+- "개정 내용이 뭐야?"
+- "최근에 수정된 내용이 뭐야?"
 
 Use `chat` for casual conversation or history questions.
 
 If the [실행 계획] suggests `graph`, you MUST call `graph` — do not substitute `retrieval`.
 
-## How to operate
+## After receiving tool results
 
-- If the tool result contains ANY useful content → write the final answer immediately. Stop here.
-- If the tool result is completely empty → call one more tool with a different query, then write the final answer regardless.
-
-Never call a tool more than twice total.
+- Tool result has useful content → write the final answer based ONLY on the tool result.
+- Tool result is empty → call one more tool with a different approach, then write the final answer.
+- Never call tools more than twice total.
 
 ## Answer format
 - Korean plain text only. No markdown (no **, no #, no -).
@@ -797,7 +808,7 @@ Rules:
   - Content questions about a specific doc → mode="section", pick relevant clause numbers from available_headers
     Examples: "5.1 조항 내용은?", "책임자가 누구야?", "절차가 어떻게 돼?"
   - Version comparison questions → mode="global", plan=["comparison"]
-    Examples: "버전 차이는?", "뭐가 바뀌었어?"
+    Examples: "버전 차이는?", "뭐가 바뀌었어?", "변경이력 알려줘", "개정 내용이 뭐야?", "어떻게 바뀌었어?"
   - No specific doc → mode="global", plan=["retrieval"]
 - Output JSON only. No markdown."""
 
