@@ -13,6 +13,7 @@ from backend.agent import (
     get_version_history_tool,
     compare_versions_tool,
     get_references_tool,
+    get_impact_analysis_tool,
     normalize_doc_id,
     safe_json_loads
 )
@@ -39,7 +40,7 @@ def agent_node(state: CompareAgentState):
     llm = get_langchain_llm(model=state["model"], temperature=0.0)
     
     # 도구 바인딩
-    tools = [get_version_history_tool, compare_versions_tool, get_references_tool]
+    tools = [get_version_history_tool, compare_versions_tool, get_references_tool, get_impact_analysis_tool]
     llm_with_tools = llm.bind_tools(tools)
     
     system_prompt = f"""당신은 GMP 규정 문서의 버전 비교 및 이력 분석 전문가입니다.
@@ -51,7 +52,9 @@ def agent_node(state: CompareAgentState):
 2. **변경 사항 비교**: 
    - `compare_versions_tool`을 사용하여 두 버전 간의 조항별 차이점(ADDED, DELETED, MODIFIED)을 분석하세요.
    - 버전이 명시되지 않았다면 히스토리를 먼저 조회한 뒤 최신 2개 버전을 비교하세요.
-3. **영향 분석**: `get_references_tool`을 사용하여 변경된 문서가 참조하거나 인용하는 다른 문서(영향 범위)를 파악하세요.
+3. **영향 분석**: 
+   - `get_references_tool`을 사용하여 문서의 상위/하위 참조 관계를 파악하세요.
+   - **중요**: `get_impact_analysis_tool`을 호출하여 이 문서가 변경됨에 따라 **직접적으로 영향을 받아 수정 및 검토가 필요한 다른 문서와 특정 조항**을 정확히 파악하세요.
 
 ## 보고서 작성 지침
 1. **추가/삭제 우선 명시**: `[상세 비교]` 섹션의 가장 상단에 새롭게 추가되거나 삭제된 조항(`[상태: ADDED]` 또는 `[상태: DELETED]`)이 있다면, 해당 정보를 가장 먼저 기술하세요.
@@ -61,9 +64,10 @@ def agent_node(state: CompareAgentState):
 3. **사실 근거**: 반드시 [변경 조항 데이터 (Diff)]에 제공된 원문 정보를 바탕으로 작성하세요.
 4. **요약 섹션**: '1. 변경 핵심 요약'에는 전체 변경 사항의 취지와 핵심 내용을 전문적인 용어를 사용하여 2~3문장으로 명확하게 요약하세요.
 5. **상태 기반 요약**: '2. 상세 비교' 섹션에서는 제공된 원문의 핵심 내용을 파악하여 요약된 형태로 기술하세요. [변경 전:]과 [변경 후:] 뒤에는 단순 원문 복사가 아닌, 해당 조항에서 무엇이 어떻게 달라졌는지 핵심을 요약하여 작성하세요.
-6. **영향 평가**: '3. 영향 평가' 섹션에는 제공된 영향 분석 데이터를 바탕으로, 이 변경이 다른 문서나 프로세스에 미칠 구체적인 파급 효과를 분석하여 기술하세요.
+6. **영향 평가 (핵심)**: '3. 영향 평가' 섹션에는 `get_impact_analysis_tool`에서 반환된 데이터를 바탕으로, **어떤 문서의 어떤 조항이 이 변경에 의해 영향을 받는지(수정/검토가 필요한지)** 구체적인 문서 번호와 사유를 명시하세요. 데이터가 없다면 "직접적인 파급 효과가 확인되지 않음"으로 기재하세요.
 7. **언어**: 모든 내용은 반드시 한국어로 작성하세요.
 8. **가독성 및 레이아웃 (필수)**:
+    - 모든 섹션 헤더(`[변경 핵심 요약]`, `[상세 비교]`, `[영향 평가]`, `[참고 문서]` 등)는 반드시 단 한 번만 사용하고, 중복해서 출력하지 마세요.
     - 모든 섹션 헤더는 대괄호(`[]`)를 사용하세요. (예: `[상세 비교]`, `[영향 평가]`)
     - `[상세 비교]` 섹션 내의 조항들은 반드시 `1. 조항 X.X`, `2. 조항 Y.Y`와 같이 번호를 매기세요.
     - 각 조항 하위의 `-변경 전:`과 `-변경 후:`는 반드시 **새로운 줄**에서 시작하고, 앞에 하이픈(`-`)과 들여쓰기를 적용하세요.
@@ -94,10 +98,10 @@ def agent_node(state: CompareAgentState):
 -(영향을 받는 문서명과 구체적인 영향 사유 기술)
 
 [참고 문서]
-[USE: 문서ID | 조항/버전] 형식으로 나열
+[USE: 문서ID | 조항/버전]
 
 [DONE]
-\"\"\"
+"""
     
     messages = [{"role": "system", "content": system_prompt}] + state["messages"]
     response = llm_with_tools.invoke(messages)
@@ -112,7 +116,8 @@ def tool_node(state: CompareAgentState):
     tool_map = {
         "get_version_history_tool": get_version_history_tool,
         "compare_versions_tool": compare_versions_tool,
-        "get_references_tool": get_references_tool
+        "get_references_tool": get_references_tool,
+        "get_impact_analysis_tool": get_impact_analysis_tool
     }
     
     outputs = []
