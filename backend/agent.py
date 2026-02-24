@@ -196,18 +196,46 @@ def get_version_history_tool(doc_id: str) -> str:
 
 @tool
 def compare_versions_tool(doc_id: str, v1: str, v2: str) -> str:
-
-    """두 버전의 문서 내용을 비교하여 반환"""
+    """두 버전의 문서 내용을 조항 단위로 비교하여 차이점을 반환합니다.
+    doc_id: 문서 번호 (예: EQ-SOP-00001)
+    v1: 이전 버전 (예: 1.0)
+    v2: 최신 버전 (예: 2.0)
+    """
     global _sql_store
-    if not _sql_store: return ""
+    if not _sql_store: return "저장소 연결 실패"
     
+    # 버전 번호 정규화 (v1.0 -> 1.0 등)
+    version_pattern = r'v?(\d+(?:\.\d+)*)'
+    v1_match = re.search(version_pattern, str(v1).lower())
+    v2_match = re.search(version_pattern, str(v2).lower())
+    
+    v1_norm = v1_match.group(1) if v1_match else str(v1)
+    v2_norm = v2_match.group(1) if v2_match else str(v2)
 
-    doc1 = _sql_store.get_document_by_id(doc_id, v1)
-    doc2 = _sql_store.get_document_by_id(doc_id, v2)
+    # SQLStore의 정밀 비교 기능 사용
+    diffs = _sql_store.get_clause_diff(doc_id, v1_norm, v2_norm)
     
-    if not doc1 or not doc2: return "비교할 버전을 찾을 수 없습니다."
+    if not diffs:
+        return f"{doc_id}의 v{v1_norm}와 v{v2_norm} 간에 변경 사항이 없거나 데이터를 찾을 수 없습니다."
     
-    return f"=== v{v1} ===\n{doc1.get('content')[:2000]}\n\n=== v{v2} ===\n{doc2.get('content')[:2000]}"
+    if isinstance(diffs, list) and len(diffs) > 0 and "error" in diffs[0]:
+        return f"비교 오류: {diffs[0]['error']}"
+
+    # 결과 포맷팅 (LLM이 이해하기 쉬운 형태)
+    lines = [f"### [{doc_id}] v{v1_norm} vs v{v2_norm} 비교 결과"]
+    for d in diffs:
+        ctype = d.get('change_type', 'UNKNOWN')
+        clause = d.get('clause', 'N/A')
+        if ctype == 'ADDED':
+            lines.append(f"- [추가] 조항 {clause}: {d.get('v2_content', '')[:300]}...")
+        elif ctype == 'DELETED':
+            lines.append(f"- [삭제] 조항 {clause}: {d.get('v1_content', '')[:300]}...")
+        elif ctype == 'MODIFIED':
+            lines.append(f"- [변경] 조항 {clause}")
+            lines.append(f"  <span style=\"color: #ff4d4e\">변경 전</span>: {d.get('v1_content', '')[:200]}...")
+            lines.append(f"  <span style=\"color: #2db7f5\">변경 후</span>: {d.get('v2_content', '')[:200]}...")
+
+    return "\n".join(lines)
 
 @tool
 def get_references_tool(doc_id: str) -> str:
