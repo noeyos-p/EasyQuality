@@ -268,6 +268,22 @@ def get_references_tool(doc_id: str) -> str:
     return result
 
 @tool
+def get_impact_analysis_tool(doc_id: str) -> str:
+    """특정 문서가 변경되었을 때 영향을 받는 다른 문서들의 상세 조항 정보를 조회합니다.
+    이 변경으로 인해 '수정되거나 검토되어야 하는' 다른 문서 목록을 파악할 때 사용합니다.
+    """
+    import json
+    global _graph_store
+    if not _graph_store:
+        return "그래프 저장소 연결 실패"
+
+    impacts = _graph_store.get_impact_analysis(doc_id)
+    if not impacts:
+        return f"{doc_id} 변경에 따른 직접적인 파급 효과 데이터가 없습니다."
+
+    return json.dumps(impacts, ensure_ascii=False)
+
+@tool
 def get_sop_headers_tool(doc_id: str) -> str:
     """특정 문서의 실제 조항(Clause) 목록과 제목을 조회합니다.
     AI가 요약 계획을 세울 때 '짐작'하지 않고 실제 구조를 파악하기 위해 사용합니다.
