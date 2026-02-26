@@ -98,16 +98,6 @@ class S3Store:
         response = self.s3.get_object(Bucket=self.bucket, Key=key)
         return response['Body'].read()
 
-    def download_document(self, doc_id: str, version: str) -> tuple:
-        """S3에서 문서 다운로드 (DOCX 우선, 없으면 PDF fallback).
-        Returns: (content_bytes, file_type) where file_type is 'docx' or 'pdf'
-        """
-        if self.object_exists(doc_id, version):
-            return self.download_docx(doc_id, version), 'docx'
-        if self.pdf_exists(doc_id, version):
-            return self.download_pdf(doc_id, version), 'pdf'
-        raise FileNotFoundError(f"S3에 문서가 없습니다: {doc_id} v{version}")
-
     def list_versions(self, doc_id: str) -> List[str]:
         """특정 문서의 S3 버전 목록 조회 (버전 문자열 리스트)"""
         prefix = f"documents/{doc_id}/"

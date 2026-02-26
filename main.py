@@ -590,52 +590,6 @@ async def save_document_content(request: SaveDocRequest, background_tasks: Backg
         "doc_name": request.doc_name
     }
 
-@app.post("/rag/upload-docx")
-async def upload_docx(
-    background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
-    doc_name: str = Form(...),
-    collection: str = Form("documents"),
-    model: str = Form("multilingual-e5-small"),
-    version: str = Form("1.0")
-):
-    """
-    DOCX 파일 업로드 및 분석 (비동기)
-    """
-    try:
-        content = await file.read()
-        filename = file.filename
-        
-        task_id = f"upload_docx_{uuid.uuid4().hex[:8]}"
-        # doc_name을 filename 대신 사용하여 알림에서 문서 ID가 보이게 함
-        update_task_status(task_id, "waiting", f"'{doc_name}' 업로드 요청이 접수되었습니다.", doc_name=doc_name, filename=filename)
-
-        # 기존 업로드 태스크 재사용 (DOCX도 동일 파이프라인 사용 가능하도록 유도)
-        background_tasks.add_task(
-            process_upload_task,
-            filename=doc_name, # 파이프라인에서 doc_id로 사용됨
-            content=content,
-            collection=collection,
-            chunk_size=500, # 기본값
-            chunk_method="article",
-            model=model,
-            overlap=50,
-            use_langgraph=True,
-            use_llm_metadata=True,
-            task_id=task_id,
-            version=version,
-        )
-
-        return {
-            "success": True,
-            "message": f"'{doc_name}' 문서의 업로드가 시작되었습니다.",
-            "task_id": task_id,
-            "doc_name": doc_name
-        }
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(500, f"🔴 DOCX 업로드 요청 실패: {str(e)}")
 
 
 
@@ -1396,36 +1350,36 @@ async def list_documents(collection: str = "documents"):
                 return "docx"
             return t or "other"
 
-        # 문서별로 그룹화 (같은 문서의 여러 버전)
+        # PDF/DOCX 완전 분리: (doc_name, doc_format) 조합으로 그룹화
         grouped: Dict[str, List[Dict]] = {}
         for doc in all_docs:
             doc_name = doc.get("doc_name")
             if not doc_name:
                 continue
-            grouped.setdefault(doc_name, []).append(doc)
+            fmt = _normalize_doc_type(doc.get("doc_type"))
+            key = f"{doc_name}|{fmt}"
+            grouped.setdefault(key, []).append(doc)
+
+        def _sort_key(d: Dict):
+            created = d.get("created_at")
+            if hasattr(created, "timestamp"):
+                return (created.timestamp(), str(d.get("version") or "0"))
+            return (0, str(d.get("version") or "0"))
 
         docs_out: List[Dict] = []
-        for doc_name, versions in grouped.items():
-            # 동일 문서명에서 pdf가 하나라도 있으면 pdf 계열만 대표 후보로 사용
-            pdf_versions = [d for d in versions if _normalize_doc_type(d.get("doc_type")) == "pdf"]
-            candidates = pdf_versions if pdf_versions else versions
+        rdb_docx_names = set()  # S3 중복 방지용
 
-            def _sort_key(d: Dict):
-                created = d.get("created_at")
-                if hasattr(created, "timestamp"):
-                    created_key = created.timestamp()
-                else:
-                    created_key = 0
-                return (created_key, str(d.get("version") or "0"))
-
-            # 대표 문서는 created_at 최신 우선 (없으면 version 문자열로 보조)
-            selected = max(candidates, key=_sort_key)
-
+        for key, versions in grouped.items():
+            selected = max(versions, key=_sort_key)
+            fmt = _normalize_doc_type(selected.get("doc_type"))
+            doc_name = selected.get("doc_name") or selected.get("doc_id")
+            if fmt == "docx":
+                rdb_docx_names.add(doc_name)
             docs_out.append({
                 "doc_id": doc_name,
                 "doc_name": doc_name,
                 "doc_type": selected.get("doc_type"),
-                "doc_format": _normalize_doc_type(selected.get("doc_type")),
+                "doc_format": fmt,
                 "doc_category": extract_document_category(doc_name),
                 "version": selected.get("version"),
                 "created_at": selected.get("created_at"),
@@ -1433,11 +1387,13 @@ async def list_documents(collection: str = "documents"):
                 "source": "rdb",
             })
 
-        # S3 DOCX 문서 병합: 동일 doc_name이 있어도 숨기지 않고 표시
+        # S3 DOCX: RDB에 없는 것만 추가
         try:
             s3_docs = await asyncio.to_thread(get_s3_store().list_docx_documents)
             for s3_doc in s3_docs:
                 doc_name = s3_doc.get("doc_name")
+                if doc_name in rdb_docx_names:
+                    continue  # RDB에 이미 있으면 중복 추가 안 함
                 docs_out.append({
                     "doc_id": doc_name,
                     "doc_name": doc_name,
@@ -2730,85 +2686,31 @@ async def process_docx_upload_task(
     collection: str,
     task_id: str
 ):
-    """DOCX 업로드 및 RAG 파이프라인 백그라운드 작업"""
+    """DOCX 업로드 - S3 저장 및 PostgreSQL 문서 등록"""
     start_time = time.time()
-    update_task_status(task_id, "processing", f"'{doc_name}' DOCX 파일을 분석 중입니다.")
-    
+    update_task_status(task_id, "processing", f"'{doc_name}' DOCX 파일을 업로드 중입니다.")
+
     try:
         # 1. S3 저장
         s3 = get_s3_store()
         s3_key = await asyncio.to_thread(s3.upload_docx, doc_name, version, content)
-        
-        # 2. 파이프라인 실행
-        model_path = resolve_model_path("multilingual-e5-small")
-        embed_model = SentenceTransformer(model_path)
-        filename = f"{doc_name}_v{version}.docx"
 
-        result = await asyncio.to_thread(
-            process_document,
-            file_path=filename,
-            content=content,
-            doc_id=doc_name,
-            use_llm_metadata=False,
-            embed_model=embed_model,
-        )
-
-        if not result.get("success"):
-            raise Exception(f"문서 처리 실패: {result.get('errors')}")
-
-        chunks_data = result.get("chunks", [])
-        
-        @dataclass
-        class _Chunk:
-            text: str
-            metadata: dict
-            index: int = 0
-
-        chunks = [_Chunk(text=c["text"], metadata=c["metadata"], index=c["index"]) for c in chunks_data]
-        update_task_status(task_id, "processing", f"DOCX 파싱 완료 (청크 {len(chunks)}개). DB 저장 중...")
-
-        # 3. Weaviate 저장
-        pipeline_version = "pdf-clause-v2.0"
-        texts = [c.text for c in chunks]
-        metadatas = [
-            {**c.metadata, "chunk_method": "article", "model": "multilingual-e5-small", "pipeline_version": pipeline_version}
-            for c in chunks
-        ]
-        await asyncio.to_thread(vector_store.add_documents, texts=texts, metadatas=metadatas, collection_name=collection, model_name=model_path)
-
-        # 4. PostgreSQL 저장
-        from backend.document_pipeline import docx_to_markdown
-        markdown_text = await asyncio.to_thread(docx_to_markdown, content)
-
-        doc_id_db = await asyncio.to_thread(
+        # 2. PostgreSQL 문서 등록 (doc_type="docx", content 없이 등록)
+        await asyncio.to_thread(
             sql_store.save_document,
             doc_name=doc_name,
-            content=markdown_text,
+            content="",
             doc_type="docx",
             version=version,
         )
-        if doc_id_db and chunks:
-            batch_chunks = [
-                {"clause": c.metadata.get("clause_id"), "content": c.text, "metadata": c.metadata}
-                for c in chunks
-            ]
-            await asyncio.to_thread(sql_store.save_chunks_batch, doc_id_db, batch_chunks)
-
-        # 5. Neo4j 저장
-        try:
-            graph = get_graph_store()
-            if graph and graph.test_connection():
-                await asyncio.to_thread(_upload_to_neo4j_from_pipeline, graph, result, filename)
-        except Exception as graph_err:
-            print(f"  Neo4j 저장 실패 (건너뜀): {graph_err}")
 
         elapsed = round(time.time() - start_time, 2)
-        update_task_status(task_id, "completed", f"DOCX 업로드 및 분석이 완료되었습니다. ({elapsed}초)", doc_name=doc_name, version=version, s3_key=s3_key)
+        update_task_status(task_id, "completed", f"DOCX 업로드가 완료되었습니다. ({elapsed}초)", doc_name=doc_name, version=version, s3_key=s3_key)
 
     except Exception as e:
         import traceback
         traceback.print_exc()
-        update_task_status(task_id, "error", f"DOCX 처리 중 오류 발생: {str(e)}")
+        update_task_status(task_id, "error", f"DOCX 업로드 중 오류 발생: {str(e)}")
 
 
 @app.post("/rag/upload-docx")
@@ -2887,29 +2789,23 @@ async def onlyoffice_config(request: OnlyOfficeConfigRequest):
                 raise HTTPException(404, f"문서를 찾을 수 없습니다: {doc_name}")
             version = versions_data[0].get('version', '1.0')
 
-        # 백엔드 내부 URL 사용 (S3 presigned URL 대신)
-        # OnlyOffice가 JWT 헤더를 붙여 요청 → 백엔드가 검증 후 S3에서 파일 서빙
+        # OnlyOffice는 DOCX 전용 - PDF는 별도 뷰어에서 처리
+        s3 = get_s3_store()
+        if not s3.object_exists(doc_name, version):
+            raise HTTPException(404, f"DOCX 파일이 없습니다: {doc_name} v{version}")
+
         from urllib.parse import quote
         encoded_doc_name = quote(doc_name, safe='')
         file_url = f"{BACKEND_URL}/onlyoffice/document/{encoded_doc_name}/{version}"
 
-        # S3에서 실제 파일 타입 확인 (DOCX 우선, PDF fallback)
-        s3 = get_s3_store()
-        if s3.object_exists(doc_name, version):
-            file_type = "docx"
-        elif s3.pdf_exists(doc_name, version):
-            file_type = "pdf"
-        else:
-            raise HTTPException(404, f"S3에 문서 파일이 없습니다: {doc_name} v{version}")
-
-        # OnlyOffice 설정 생성
+        # OnlyOffice 설정 생성 (DOCX 전용)
         config = create_editor_config(
             doc_id=doc_name,
             version=version,
             user_name=request.user_name,
             file_url=file_url,
-            mode=request.mode if file_type == "docx" else "view",
-            file_type=file_type,
+            mode=request.mode,
+            file_type="docx",
         )
 
         return {
@@ -2930,25 +2826,19 @@ async def onlyoffice_config(request: OnlyOfficeConfigRequest):
 @app.get("/onlyoffice/document/{doc_name}/{version}")
 async def serve_docx_for_onlyoffice(doc_name: str, version: str):
     """
-    OnlyOffice Document Server가 문서를 가져가는 내부 엔드포인트.
-    DOCX 우선, 없으면 PDF fallback.
+    OnlyOffice Document Server가 DOCX를 가져가는 내부 엔드포인트.
+    DOCX 전용 - PDF는 별도 뷰어에서 처리.
     """
     try:
         s3 = get_s3_store()
-        content, file_type = s3.download_document(doc_name, version)
-        if file_type == 'pdf':
-            return Response(
-                content=content,
-                media_type="application/pdf",
-                headers={"Content-Disposition": f'attachment; filename="{doc_name}_v{version}.pdf"'},
-            )
+        content = s3.download_docx(doc_name, version)
         return Response(
             content=content,
             media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             headers={"Content-Disposition": f'attachment; filename="{doc_name}_v{version}.docx"'},
         )
     except Exception as e:
-        raise HTTPException(404, f"문서를 찾을 수 없습니다: {doc_name} v{version} ({e})")
+        raise HTTPException(404, f"DOCX 문서를 찾을 수 없습니다: {doc_name} v{version} ({e})")
 
 
 @app.post("/onlyoffice/callback")
