@@ -213,8 +213,19 @@ function App() {
         setIsOnlyOfficeMode(true)
         setOnlyOfficeEditorMode('view')
       } else {
-        console.error('OnlyOffice 설정 가져오기 실패')
+        // S3에 DOCX 없는 경우 → 텍스트 뷰어로 fallback
         setIsOnlyOfficeMode(false)
+        try {
+          const url = version
+            ? `${API_URL}/rag/document/${docId}/content?version=${version}`
+            : `${API_URL}/rag/document/${docId}/content`
+          const contentRes = await fetch(url)
+          if (contentRes.ok) {
+            const data = await contentRes.json()
+            setDocumentContent(data.content || '')
+            setEditedContent(data.content || '')
+          }
+        } catch {}
       }
     } catch (error) {
       console.error('OnlyOffice 초기화 오류:', error)
